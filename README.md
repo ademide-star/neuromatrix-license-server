@@ -1,0 +1,2 @@
+# neuromatrix-license-server
+licence
