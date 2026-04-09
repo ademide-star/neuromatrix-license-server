@@ -27,7 +27,18 @@ from flask_cors import CORS
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
-CORS(app, origins=["*"])
+CORS(app, 
+     origins=["*"],
+     allow_headers=["Content-Type", "X-Admin-Secret", "Authorization"],
+     methods=["GET", "POST", "OPTIONS"],
+     supports_credentials=False)
+
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,X-Admin-Secret,Authorization')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
+    return response
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -242,6 +253,21 @@ def health():
         "version": "1.0.0",
         "licenses_issued": len(LICENSE_DB),
     })
+
+@app.route("/admin/demo", methods=["OPTIONS"])
+@app.route("/admin/demo/bulk", methods=["OPTIONS"])
+@app.route("/admin/generate", methods=["OPTIONS"])
+@app.route("/admin/licenses", methods=["OPTIONS"])
+@app.route("/admin/stats", methods=["OPTIONS"])
+@app.route("/admin/revoke", methods=["OPTIONS"])
+@app.route("/verify", methods=["OPTIONS"])
+def handle_options():
+    """Handle CORS preflight for all admin routes"""
+    response = jsonify({"status": "ok"})
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,X-Admin-Secret')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
+    return response, 200
 
 # ── Paystack webhook ──────────────────────────────────────────────────────────
 
