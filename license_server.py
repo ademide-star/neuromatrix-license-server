@@ -27,17 +27,12 @@ from flask_cors import CORS
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
-CORS(app, 
-     origins=["*"],
-     allow_headers=["Content-Type", "X-Admin-Secret", "Authorization"],
-     methods=["GET", "POST", "OPTIONS"],
-     supports_credentials=False)
 
 @app.after_request
 def after_request(response):
-    response.headers.add('Access-Control-Allow-Origin', '*')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,X-Admin-Secret,Authorization')
-    response.headers.add('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
+    response.headers.set('Access-Control-Allow-Origin', '*')
+    response.headers.set('Access-Control-Allow-Headers', 'Content-Type,X-Admin-Secret,Authorization')
+    response.headers.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
     return response
 
 logging.basicConfig(level=logging.INFO)
