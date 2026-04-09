@@ -458,77 +458,20 @@ def admin_generate():
 @require_admin
 def admin_demo():
     """Generate time-limited demo license for students"""
-    data         = request.get_json()
-    email        = data.get("email")
-    name         = data.get("name", "Student")
-    institution  = data.get("institution", "University of Ilorin")
-    duration_days= int(data.get("duration_days", 30))  # default 30 days
+    try:
+        data         = request.get_json()
+        if not data:
+            return jsonify({"error": "No JSON data received"}), 400
 
-    if not email:
-        return jsonify({"error": "Email required"}), 400
+        email        = data.get("email", "").strip()
+        name         = data.get("name", "Student").strip()
+        institution  = data.get("institution", "University of Ilorin").strip()
+        duration_days= int(data.get("duration_days", 30))
 
-    # Cap at 90 days max
-    duration_days = min(duration_days, 90)
-
-    license_key = generate_license_key("student")
-    while license_key in LICENSE_DB:
-        license_key = generate_license_key("student")
-
-    expires_at = (datetime.utcnow() + timedelta(days=duration_days)).isoformat()
-
-    LICENSE_DB[license_key] = {
-        "key":          license_key,
-        "email":        email,
-        "name":         name,
-        "institution":  institution,
-        "plan":         "student_demo",
-        "features":     [
-            "mwm_full", "ymaze", "oft", "heatmap",
-            "png_export", "probe_trial", "learning_curve",
-            "trajectory", "csv_export",
-        ],
-        "seats":        1,
-        "created_at":   datetime.utcnow().isoformat(),
-        "expires_at":   expires_at,
-        "duration_days":duration_days,
-        "ref":          "DEMO-" + secrets.token_hex(4).upper(),
-        "active":       True,
-        "activations":  [],
-        "is_demo":      True,
-    }
-
-    # Send email with expiry info
-    send_demo_email(email, name, institution, license_key, duration_days, expires_at)
-
-    log.info(f"[Demo] Generated {license_key} for {email} — expires {expires_at}")
-
-    return jsonify({
-        "license_key":   license_key,
-        "email":         email,
-        "expires_at":    expires_at,
-        "duration_days": duration_days,
-        "plan":          "student_demo",
-    }), 200
-
-@app.route("/admin/demo/bulk", methods=["POST"])
-@require_admin
-def admin_demo_bulk():
-    """Generate demo licenses for multiple students at once"""
-    data         = request.get_json()
-    students     = data.get("students", [])  # list of {email, name}
-    institution  = data.get("institution", "University of Ilorin")
-    duration_days= int(data.get("duration_days", 30))
-    duration_days= min(duration_days, 90)
-
-    if not students:
-        return jsonify({"error": "No students provided"}), 400
-
-    results = []
-    for student in students:
-        email = student.get("email")
-        name  = student.get("name", "Student")
         if not email:
-            continue
+            return jsonify({"error": "Email required"}), 400
+
+        duration_days = min(max(duration_days, 1), 90)
 
         license_key = generate_license_key("student")
         while license_key in LICENSE_DB:
@@ -543,9 +486,9 @@ def admin_demo_bulk():
             "institution":  institution,
             "plan":         "student_demo",
             "features":     [
-                "mwm_full","ymaze","oft","heatmap",
-                "png_export","probe_trial","learning_curve",
-                "trajectory","csv_export",
+                "mwm_full", "ymaze", "oft", "heatmap",
+                "png_export", "probe_trial", "learning_curve",
+                "trajectory", "csv_export",
             ],
             "seats":        1,
             "created_at":   datetime.utcnow().isoformat(),
@@ -557,14 +500,106 @@ def admin_demo_bulk():
             "is_demo":      True,
         }
 
-        send_demo_email(email, name, institution, license_key, duration_days, expires_at)
-        results.append({"email": email, "license_key": license_key, "expires_at": expires_at})
-        log.info(f"[Demo Bulk] {license_key} → {email}")
+        log.info(f"[Demo] Generated {license_key} for {email} — expires {expires_at}")
 
-    return jsonify({
-        "generated": len(results),
-        "licenses":  results,
-    }), 200
+        # Try email — don't crash if it fails
+        email_sent = False
+        try:
+            email_sent = send_demo_email(email, name, institution, license_key, duration_days, expires_at)
+        except Exception as e:
+            log.error(f"[Demo Email] Failed: {e}")
+
+        return jsonify({
+            "license_key":   license_key,
+            "email":         email,
+            "expires_at":    expires_at,
+            "duration_days": duration_days,
+            "plan":          "student_demo",
+            "email_sent":    email_sent,
+        }), 200
+
+    except Exception as e:
+        log.error(f"[Demo] Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/admin/demo/bulk", methods=["POST"])
+@require_admin
+def admin_demo_bulk():
+    """Generate demo licenses for multiple students at once"""
+    try:
+        data         = request.get_json()
+        if not data:
+            return jsonify({"error": "No JSON data received"}), 400
+
+        students     = data.get("students", [])
+        institution  = data.get("institution", "University of Ilorin")
+        duration_days= int(data.get("duration_days", 30))
+        duration_days= min(max(duration_days, 1), 90)
+
+        if not students:
+            return jsonify({"error": "No students provided"}), 400
+
+        results = []
+        for student in students:
+            email = student.get("email", "").strip()
+            name  = student.get("name", "Student").strip()
+            if not email:
+                continue
+
+            try:
+                license_key = generate_license_key("student")
+                while license_key in LICENSE_DB:
+                    license_key = generate_license_key("student")
+
+                expires_at = (datetime.utcnow() + timedelta(days=duration_days)).isoformat()
+
+                LICENSE_DB[license_key] = {
+                    "key":          license_key,
+                    "email":        email,
+                    "name":         name,
+                    "institution":  institution,
+                    "plan":         "student_demo",
+                    "features":     [
+                        "mwm_full","ymaze","oft","heatmap",
+                        "png_export","probe_trial","learning_curve",
+                        "trajectory","csv_export",
+                    ],
+                    "seats":        1,
+                    "created_at":   datetime.utcnow().isoformat(),
+                    "expires_at":   expires_at,
+                    "duration_days":duration_days,
+                    "ref":          "DEMO-" + secrets.token_hex(4).upper(),
+                    "active":       True,
+                    "activations":  [],
+                    "is_demo":      True,
+                }
+
+                # Try email — don't crash if it fails
+                try:
+                    send_demo_email(email, name, institution, license_key, duration_days, expires_at)
+                except Exception as e:
+                    log.error(f"[Bulk Email] Failed for {email}: {e}")
+
+                results.append({
+                    "email":       email,
+                    "name":        name,
+                    "license_key": license_key,
+                    "expires_at":  expires_at,
+                })
+                log.info(f"[Demo Bulk] {license_key} → {email}")
+
+            except Exception as e:
+                log.error(f"[Bulk] Failed for {email}: {e}")
+                continue
+
+        return jsonify({
+            "generated": len(results),
+            "licenses":  results,
+        }), 200
+
+    except Exception as e:
+        log.error(f"[Bulk] Error: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/admin/revoke", methods=["POST"])
 @require_admin
@@ -579,29 +614,31 @@ def revoke_license():
 
 @app.route("/admin/stats", methods=["GET"])
 @require_admin
-def admin_stats():
+def stats():
     """Dashboard stats"""
     plans_count = {}
     for lic in LICENSE_DB.values():
         p = lic["plan"]
         plans_count[p] = plans_count.get(p, 0) + 1
 
-    revenue = sum(
+    revenue_ngn = sum(
         PLANS[lic["plan"]]["ngn"]
         for lic in LICENSE_DB.values()
-        if lic.get("active")
+        if lic.get("active") and lic["plan"] in PLANS
+    )
+
+    revenue_usd = sum(
+        PLANS[lic["plan"]]["usd"]
+        for lic in LICENSE_DB.values()
+        if lic.get("active") and lic["plan"] in PLANS
     )
 
     return jsonify({
-        "total_licenses": len(LICENSE_DB),
-        "active":         sum(1 for l in LICENSE_DB.values() if l.get("active")),
-        "by_plan":        plans_count,
-        "total_revenue_ngn": revenue,
-        "total_revenue_usd": sum(
-            PLANS[lic["plan"]]["usd"]
-            for lic in LICENSE_DB.values()
-            if lic.get("active")
-        ),
+        "total_licenses":    len(LICENSE_DB),
+        "active":            sum(1 for l in LICENSE_DB.values() if l.get("active")),
+        "by_plan":           plans_count,
+        "total_revenue_ngn": revenue_ngn,
+        "total_revenue_usd": revenue_usd,
     }), 200
 
 # ── Run ───────────────────────────────────────────────────────────────────────
@@ -610,6 +647,3 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     log.info(f"[License Server] Starting on port {port}")
     app.run(host="0.0.0.0", port=port, debug=False)
-
-
-
