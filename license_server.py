@@ -579,7 +579,7 @@ def revoke_license():
 
 @app.route("/admin/stats", methods=["GET"])
 @require_admin
-def stats():
+def admin_stats():
     """Dashboard stats"""
     plans_count = {}
     for lic in LICENSE_DB.values():
