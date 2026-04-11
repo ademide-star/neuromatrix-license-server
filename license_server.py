@@ -1,665 +1,774 @@
-"""
-NeuroMatrix Biosystems — License Key Backend
-============================================
-Handles license generation, verification, Paystack webhooks and .exe downloads.
-
-Deploy on Render.com (free tier) as a separate service from server.py
-
-Requirements:
-  pip install flask flask-cors requests python-dotenv cryptography
-"""
-
-import os
-import json
-import hmac
-import uuid
-import hashlib
-import secrets
-import smtplib
-import logging
-from datetime import datetime, timedelta
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from functools import wraps
-
-from flask import Flask, request, jsonify, send_file, abort
-
-# ── Setup ─────────────────────────────────────────────────────────────────────
-app = Flask(__name__)
-
-@app.before_request
-def handle_preflight():
-    """Intercept OPTIONS requests before any auth check"""
-    if request.method == "OPTIONS":
-        response = app.make_default_options_response()
-        response.headers.set('Access-Control-Allow-Origin', '*')
-        response.headers.set('Access-Control-Allow-Headers', 'Content-Type,X-Admin-Secret,Authorization')
-        response.headers.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
-        response.headers.set('Access-Control-Max-Age', '3600')
-        return response
-
-@app.after_request
-def after_request(response):
-    response.headers.set('Access-Control-Allow-Origin', '*')
-    response.headers.set('Access-Control-Allow-Headers', 'Content-Type,X-Admin-Secret,Authorization')
-    response.headers.set('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
-    return response
-
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger(__name__)
-
-# ── Config (set these as environment variables on Render) ─────────────────────
-PAYSTACK_SECRET      = os.environ.get("PAYSTACK_SECRET_KEY", "sk_test_REPLACE")
-EMAIL_HOST           = os.environ.get("EMAIL_HOST",           "smtp.gmail.com")
-EMAIL_PORT           = int(os.environ.get("EMAIL_PORT",       "587"))
-EMAIL_USER           = os.environ.get("EMAIL_USER",           "neuromatrixbiosystem@gmail.com")
-EMAIL_PASS           = os.environ.get("EMAIL_PASS",           "your_app_password")
-ADMIN_EMAIL          = os.environ.get("ADMIN_EMAIL",          "neuromatrixbiosystem@gmail.com")
-DOWNLOAD_URL         = os.environ.get("DOWNLOAD_URL",         "https://your-download-link.com/neurotrack-setup.exe")
-ADMIN_SECRET         = os.environ.get("ADMIN_SECRET",         "change-this-secret")
-
-# ── In-memory license store (replace with DB on production) ───────────────────
-# Structure: { "NMBT-XXXX-XXXX-XXXX": { ...license data... } }
-LICENSE_DB = {}
-
-# ── Plan definitions ──────────────────────────────────────────────────────────
-PLANS = {
-    "student": {
-        "name":          "Student License",
-        "seats":         1,
-        "ngn":           49000,
-        "usd":           29,
-        "features":      ["mwm_basic", "trajectory", "csv_export"],
-        "upgrade_years": None,
-    },
-    "researcher": {
-        "name":          "Researcher License",
-        "seats":         1,
-        "ngn":           79000,
-        "usd":           49,
-        "features":      ["mwm_full", "ymaze", "oft", "heatmap", "png_export",
-                          "probe_trial", "learning_curve", "trajectory", "csv_export"],
-        "upgrade_years": 1,
-    },
-    "institution": {
-        "name":          "Institution License",
-        "seats":         5,
-        "ngn":           149000,
-        "usd":           89,
-        "features":      ["mwm_full", "ymaze", "oft", "heatmap", "png_export",
-                          "probe_trial", "learning_curve", "trajectory", "csv_export",
-                          "multi_seat", "api_access", "custom_branding"],
-        "upgrade_years": None,  # lifetime
-    },
-}
-
-# ── Utils ──────────────────────────────────────────────────────────────────────
-
-def generate_license_key(plan: str) -> str:
-    """Generate a unique license key: NMBT-XXXX-XXXX-XXXX"""
-    prefix = "NMBT"
-    parts  = [secrets.token_hex(2).upper() for _ in range(3)]
-    return f"{prefix}-{parts[0]}-{parts[1]}-{parts[2]}"
-
-def verify_paystack_signature(payload: bytes, signature: str) -> bool:
-    """Verify Paystack webhook signature"""
-    expected = hmac.new(
-        PAYSTACK_SECRET.encode("utf-8"),
-        payload,
-        hashlib.sha512
-    ).hexdigest()
-    return hmac.compare_digest(expected, signature)
-
-def send_license_email(email: str, name: str, plan: str, license_key: str):
-    """Send license key email to buyer"""
-    plan_info = PLANS.get(plan, {})
-    subject   = f"🧠 Your NeuroTrack Pro License Key — {plan_info.get('name', plan)}"
-
-    html = f"""
 <!DOCTYPE html>
-<html>
-<body style="background:#070b16;color:#e2e8f0;font-family:'Courier New',monospace;padding:40px;max-width:600px;margin:0 auto;">
-  <div style="text-align:center;margin-bottom:32px;">
-    <div style="font-size:32px;">🧠</div>
-    <h1 style="color:#c9a84c;font-size:20px;letter-spacing:0.15em;margin:8px 0;">NEUROMATRIX BIOSYSTEMS</h1>
-    <p style="color:#4a5568;font-size:10px;letter-spacing:0.3em;text-transform:uppercase;">NeuroTrack Pro</p>
-  </div>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NeuroMatrix Admin — License Dashboard</title>
+  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@300;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-  <div style="background:#0d1428;border:1px solid #1e2a4a;border-radius:12px;padding:32px;margin-bottom:24px;">
-    <p style="color:#4a5568;font-size:11px;margin-bottom:8px;">Dear {name},</p>
-    <p style="font-size:12px;line-height:1.8;color:#e2e8f0;margin-bottom:24px;">
-      Thank you for purchasing <strong style="color:#c9a84c;">NeuroTrack Pro — {plan_info.get('name', plan)}</strong>.
-      Your perpetual license key is below.
-    </p>
-
-    <div style="background:#070b16;border:2px solid #c9a84c66;border-radius:8px;padding:20px;text-align:center;margin-bottom:24px;">
-      <p style="color:#4a5568;font-size:9px;letter-spacing:0.2em;text-transform:uppercase;margin-bottom:8px;">Your License Key</p>
-      <p style="color:#c9a84c;font-size:22px;font-weight:700;letter-spacing:0.15em;">{license_key}</p>
-    </div>
-
-    <h3 style="color:#c9a84c;font-size:12px;letter-spacing:0.1em;margin-bottom:12px;">HOW TO ACTIVATE:</h3>
-    <ol style="color:#4a5568;font-size:11px;line-height:2;padding-left:20px;">
-      <li>Go to <a href="https://neuromatrixbiosystems.com/pricing" style="color:#c9a84c;">neuromatrixbiosystems.com/pricing</a></li>
-      <li>Scroll to <strong style="color:#e2e8f0;">"Already have a license?"</strong></li>
-      <li>Enter your key and click <strong style="color:#e2e8f0;">Verify</strong></li>
-      <li>Access the web app or download the desktop .exe</li>
-    </ol>
-
-    <h3 style="color:#c9a84c;font-size:12px;letter-spacing:0.1em;margin:20px 0 12px;">YOUR PLAN INCLUDES:</h3>
-    <ul style="color:#4a5568;font-size:11px;line-height:2;padding-left:20px;">
-      {"".join(f"<li style='color:#00f5c4;'>✓ {f.replace('_',' ').title()}</li>" for f in plan_info.get('features', []))}
-      <li style="color:#00f5c4;">✓ {plan_info.get('seats', 1)} seat(s)</li>
-      <li style="color:#00f5c4;">✓ Web app + Desktop .exe</li>
-    </ul>
-  </div>
-
-  <div style="background:#0d1428;border:1px solid #1e2a4a;border-radius:8px;padding:20px;margin-bottom:24px;">
-    <p style="color:#4a5568;font-size:10px;line-height:1.8;">
-      💡 <strong style="color:#e2e8f0;">Keep this email safe</strong> — your license key is permanent.<br/>
-      🔬 For support: <a href="mailto:neuromatrixbiosystems@gmail.com" style="color:#c9a84c;">neuromatrixbiosystems@gmail.com</a><br/>
-      🌐 Website: <a href="https://neuromatrixbiosystems.com" style="color:#c9a84c;">neuromatrixbiosystems.com</a>
-    </p>
-  </div>
-
-  <p style="text-align:center;color:#2d3748;font-size:9px;letter-spacing:0.1em;">
-    © 2026 NeuroMatrix Biosystems · University of Ilorin · GRASP/NIH/DSI Program
-  </p>
-</body>
-</html>
-"""
-    try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"]    = EMAIL_USER
-        msg["To"]      = email
-        msg.attach(MIMEText(html, "html"))
-
-        with smtplib.SMTP(EMAIL_HOST, EMAIL_PORT) as server:
-            server.starttls()
-            server.login(EMAIL_USER, EMAIL_PASS)
-            server.sendmail(EMAIL_USER, [email, ADMIN_EMAIL], msg.as_string())
-
-        log.info(f"[Email] Sent license to {email}")
-        return True
-    except Exception as e:
-        log.error(f"[Email] Failed: {e}")
-        return False
-
-def send_demo_email(email, name, institution, license_key, duration_days, expires_at):
-    """Send demo license email with expiry info to student"""
-    expiry_date = datetime.fromisoformat(expires_at).strftime("%B %d, %Y")
-    subject     = f"🧠 NeuroTrack Pro — {duration_days}-Day Demo License"
-    html = f"""
-<!DOCTYPE html>
-<html>
-<body style="background:#070b16;color:#e2e8f0;font-family:'Courier New',monospace;padding:40px;max-width:600px;margin:0 auto;">
-  <div style="text-align:center;margin-bottom:32px;">
-    <h1 style="color:#c9a84c;font-size:20px;letter-spacing:0.15em;">NEUROMATRIX BIOSYSTEMS</h1>
-    <p style="color:#4a5568;font-size:10px;letter-spacing:0.3em;">STUDENT DEMO LICENSE</p>
-  </div>
-  <div style="background:#0d1428;border:1px solid #1e2a4a;border-radius:12px;padding:32px;margin-bottom:24px;">
-    <p style="font-size:12px;color:#e2e8f0;margin-bottom:20px;">
-      Dear {name}, your <strong style="color:#c9a84c;">{duration_days}-day demo license</strong>
-      for NeuroTrack Pro has been issued by your instructor at
-      <strong style="color:#e2e8f0;">{institution}</strong>.
-    </p>
-    <div style="background:#070b16;border:2px solid #c9a84c66;border-radius:8px;padding:20px;text-align:center;margin-bottom:20px;">
-      <p style="color:#4a5568;font-size:9px;letter-spacing:0.2em;margin-bottom:8px;">YOUR LICENSE KEY</p>
-      <p style="color:#c9a84c;font-size:22px;font-weight:700;letter-spacing:0.15em;">{license_key}</p>
-      <p style="color:#ff6b6b;font-size:10px;margin-top:8px;">⏰ Expires: {expiry_date}</p>
-    </div>
-    <div style="background:#ff6b6b11;border:1px solid #ff6b6b33;border-radius:8px;padding:14px;margin-bottom:20px;">
-      <p style="color:#ff6b6b;font-size:10px;line-height:1.7;margin:0;">
-        ⚠️ Demo license — expires <strong>{expiry_date}</strong>.
-        After expiry, purchase at neuromatrixbiosystems.com/pricing
-      </p>
-    </div>
-    <p style="color:#c9a84c;font-size:11px;margin-bottom:8px;font-weight:700;">HOW TO ACTIVATE:</p>
-    <ol style="color:#4a5568;font-size:11px;line-height:2;padding-left:20px;">
-      <li>Go to neuromatrixbiosystems.com/pricing</li>
-      <li>Scroll to "Already have a license?"</li>
-      <li>Enter key → click Verify</li>
-      <li>Access web app or download desktop .exe</li>
-    </ol>
-    <p style="color:#c9a84c;font-size:11px;margin:16px 0 8px;font-weight:700;">INCLUDES — Full Access:</p>
-    <p style="color:#00f5c4;font-size:11px;line-height:2;">
-      ✓ MWM full analysis &nbsp; ✓ Y-Maze &nbsp; ✓ Open Field Test<br/>
-      ✓ Heatmap &nbsp; ✓ PNG + CSV export &nbsp; ✓ Web + Desktop
-    </p>
-  </div>
-  <p style="text-align:center;color:#2d3748;font-size:9px;">
-    © 2026 NeuroMatrix Biosystems · University of Ilorin
-  </p>
-</body>
-</html>"""
-    try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"]    = EMAIL_USER
-        msg["To"]      = email
-        msg.attach(MIMEText(html, "html"))
-        with smtplib.SMTP(EMAIL_HOST, EMAIL_PORT) as server:
-            server.starttls()
-            server.login(EMAIL_USER, EMAIL_PASS)
-            server.sendmail(EMAIL_USER, [email, ADMIN_EMAIL], msg.as_string())
-        log.info(f"[Demo Email] Sent to {email}")
-        return True
-    except Exception as e:
-        log.error(f"[Demo Email] Failed: {e}")
-        return False
-
-# ── ROUTES ────────────────────────────────────────────────────────────────────
-
-@app.route("/")
-def health():
-    return jsonify({
-        "service": "NeuroMatrix License Server",
-        "status":  "ok",
-        "version": "1.0.0",
-        "licenses_issued": len(LICENSE_DB),
-    })
-
-# ── Paystack webhook ──────────────────────────────────────────────────────────
-
-@app.route("/webhook/paystack", methods=["POST"])
-def paystack_webhook():
-    """Receives Paystack payment confirmation — generates and emails license key"""
-    payload   = request.get_data()
-    signature = request.headers.get("X-Paystack-Signature", "")
-
-    if not verify_paystack_signature(payload, signature):
-        log.warning("[Webhook] Invalid Paystack signature")
-        return jsonify({"error": "Invalid signature"}), 401
-
-    try:
-        event = json.loads(payload)
-        log.info(f"[Webhook] Event: {event.get('event')}")
-
-        if event.get("event") != "charge.success":
-            return jsonify({"status": "ignored"}), 200
-
-        data     = event["data"]
-        email    = data["customer"]["email"]
-        amount   = data["amount"] / 100  # convert from kobo
-        ref      = data["reference"]
-        metadata = data.get("metadata", {})
-        fields   = {f["variable_name"]: f["value"] for f in metadata.get("custom_fields", [])}
-
-        name        = fields.get("buyer_name", "Researcher")
-        institution = fields.get("institution", "")
-        plan_key    = _detect_plan_from_amount(amount)
-
-        log.info(f"[Webhook] Payment: {email} | {plan_key} | ₦{amount} | ref:{ref}")
-
-        # Generate license key
-        license_key = generate_license_key(plan_key)
-        while license_key in LICENSE_DB:
-            license_key = generate_license_key(plan_key)
-
-        # Store license
-        LICENSE_DB[license_key] = {
-            "key":         license_key,
-            "email":       email,
-            "name":        name,
-            "institution": institution,
-            "plan":        plan_key,
-            "features":    PLANS[plan_key]["features"],
-            "seats":       PLANS[plan_key]["seats"],
-            "created_at":  datetime.utcnow().isoformat(),
-            "ref":         ref,
-            "active":      True,
-            "activations": [],
-        }
-
-        log.info(f"[License] Generated: {license_key} for {email}")
-
-        # Send email
-        email_sent = send_license_email(email, name, plan_key, license_key)
-        log.info(f"[Email] Sent: {email_sent}")
-
-        return jsonify({
-            "status":      "success",
-            "license_key": license_key,
-            "email_sent":  email_sent,
-        }), 200
-
-    except Exception as e:
-        log.error(f"[Webhook] Error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-def _detect_plan_from_amount(amount: float) -> str:
-    """Detect plan from payment amount"""
-    if amount >= 149000:  return "institution"
-    if amount >= 79000:   return "researcher"
-    return "student"
-
-# ── Verify license ────────────────────────────────────────────────────────────
-
-@app.route("/verify", methods=["POST"])
-def verify_license():
-    """Verify a license key — called by App.js on load"""
-    data = request.get_json()
-    key  = data.get("key", "").strip().upper()
-
-    if not key:
-        return jsonify({"valid": False, "error": "No key provided"}), 400
-
-    license = LICENSE_DB.get(key)
-
-    if not license:
-        return jsonify({"valid": False, "error": "License not found"}), 404
-
-    if not license.get("active"):
-        return jsonify({"valid": False, "error": "License deactivated"}), 403
-
-    # ── Check expiry for demo/student licenses ──
-    expires_at = license.get("expires_at")
-    if expires_at:
-        expiry = datetime.fromisoformat(expires_at)
-        if datetime.utcnow() > expiry:
-            license["active"] = False
-            days_expired = (datetime.utcnow() - expiry).days
-            return jsonify({
-                "valid": False,
-                "error": f"Demo license expired {days_expired} day(s) ago. Purchase a full license at neuromatrixbiosystems.com/pricing",
-                "expired": True,
-            }), 403
-
-        # Include days remaining in response
-        days_left = (expiry - datetime.utcnow()).days
-        license["days_remaining"] = days_left
-
-    # Track activation
-    ip = request.remote_addr
-    if ip not in license["activations"]:
-        if len(license["activations"]) >= license["seats"]:
-            return jsonify({
-                "valid":  False,
-                "error":  f"Seat limit reached ({license['seats']} seats). Contact support to add more.",
-            }), 403
-        license["activations"].append(ip)
-
-    return jsonify({
-        "valid":         True,
-        "plan":          license["plan"],
-        "features":      license["features"],
-        "seats":         license["seats"],
-        "name":          license["name"],
-        "email":         license["email"],
-        "expires_at":    license.get("expires_at"),
-        "days_remaining":license.get("days_remaining"),
-        "is_demo":       license.get("is_demo", False),
-    }), 200
-
-# ── Download .exe ─────────────────────────────────────────────────────────────
-
-@app.route("/download", methods=["POST"])
-def download_exe():
-    """Return download link after license verification"""
-    data = request.get_json()
-    key  = data.get("key", "").strip().upper()
-    license = LICENSE_DB.get(key)
-
-    if not license or not license.get("active"):
-        return jsonify({"error": "Invalid or inactive license"}), 403
-
-    # Return signed download URL
-    # In production: generate a signed S3/Cloudflare URL
-    return jsonify({
-        "download_url": DOWNLOAD_URL,
-        "expires_in":   "1 hour",
-        "version":      "2.1.0",
-        "filename":     "NeuroTrack-Pro-Setup.exe",
-    }), 200
-
-# ── Admin routes ──────────────────────────────────────────────────────────────
-
-def require_admin(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        secret = request.headers.get("X-Admin-Secret", "")
-        if secret != ADMIN_SECRET:
-            return jsonify({"error": "Unauthorized"}), 401
-        return f(*args, **kwargs)
-    return decorated
-
-@app.route("/admin/licenses", methods=["GET"])
-@require_admin
-def list_licenses():
-    """List all licenses — admin only"""
-    return jsonify({
-        "total":    len(LICENSE_DB),
-        "licenses": list(LICENSE_DB.values()),
-    }), 200
-
-@app.route("/admin/generate", methods=["POST"])
-@require_admin
-def admin_generate():
-    """Manually generate a license key — for bank transfers"""
-    data  = request.get_json()
-    email = data.get("email")
-    name  = data.get("name", "Researcher")
-    plan  = data.get("plan", "researcher")
-
-    if not email or plan not in PLANS:
-        return jsonify({"error": "Invalid email or plan"}), 400
-
-    license_key = generate_license_key(plan)
-    while license_key in LICENSE_DB:
-        license_key = generate_license_key(plan)
-
-    LICENSE_DB[license_key] = {
-        "key":         license_key,
-        "email":       email,
-        "name":        name,
-        "institution": data.get("institution", ""),
-        "plan":        plan,
-        "features":    PLANS[plan]["features"],
-        "seats":       PLANS[plan]["seats"],
-        "created_at":  datetime.utcnow().isoformat(),
-        "ref":         "MANUAL-" + secrets.token_hex(4).upper(),
-        "active":      True,
-        "activations": [],
+    :root {
+      --gold:    #c9a84c;
+      --gold-d:  #c9a84c22;
+      --gold-m:  #c9a84c66;
+      --bg:      #070b16;
+      --surface: #0a0e1a;
+      --panel:   #0d1428;
+      --border:  #1e2a4a;
+      --text:    #e2e8f0;
+      --muted:   #4a5568;
+      --dim:     #2d3748;
+      --green:   #00f5c4;
+      --red:     #ff6b6b;
+      --blue:    #63b3ed;
+      --purple:  #6c63ff;
     }
 
-    email_sent = send_license_email(email, name, plan, license_key)
+    body {
+      background: var(--bg); color: var(--text);
+      font-family: 'IBM Plex Mono', monospace;
+      min-height: 100vh;
+    }
 
-    return jsonify({
-        "license_key": license_key,
-        "email_sent":  email_sent,
-        "plan":        plan,
-    }), 200
+    ::-webkit-scrollbar { width: 4px; }
+    ::-webkit-scrollbar-track { background: var(--bg); }
+    ::-webkit-scrollbar-thumb { background: var(--gold-m); border-radius: 2px; }
 
-@app.route("/admin/demo", methods=["POST"])
-@require_admin
-def admin_demo():
-    """Generate time-limited demo license for students"""
-    try:
-        data         = request.get_json()
-        if not data:
-            return jsonify({"error": "No JSON data received"}), 400
+    .login-screen {
+      min-height: 100vh; display: flex;
+      align-items: center; justify-content: center;
+      background: radial-gradient(ellipse 60% 60% at 50% 0%, #c9a84c08, transparent);
+    }
 
-        email        = data.get("email", "").strip()
-        name         = data.get("name", "Student").strip()
-        institution  = data.get("institution", "University of Ilorin").strip()
-        duration_days= int(data.get("duration_days", 30))
+    .login-box {
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 16px; padding: 48px 40px;
+      width: 100%; max-width: 400px; text-align: center;
+    }
 
-        if not email:
-            return jsonify({"error": "Email required"}), 400
+    .login-logo { font-size: 40px; margin-bottom: 16px; }
 
-        duration_days = min(max(duration_days, 1), 90)
+    .login-title {
+      font-family: 'Cormorant Garamond', serif;
+      font-size: 28px; font-weight: 600; color: var(--text);
+      margin-bottom: 4px;
+    }
 
-        license_key = generate_license_key("student")
-        while license_key in LICENSE_DB:
-            license_key = generate_license_key("student")
+    .login-sub { font-size: 9px; color: var(--muted); letter-spacing: 0.2em; margin-bottom: 32px; }
 
-        expires_at = (datetime.utcnow() + timedelta(days=duration_days)).isoformat()
+    .login-input {
+      width: 100%; background: var(--surface); border: 1px solid var(--border);
+      border-radius: 8px; padding: 12px 16px; color: var(--text);
+      font-family: 'IBM Plex Mono', monospace; font-size: 13px;
+      outline: none; transition: border-color 0.2s; margin-bottom: 12px;
+      letter-spacing: 0.05em;
+    }
 
-        LICENSE_DB[license_key] = {
-            "key":          license_key,
-            "email":        email,
-            "name":         name,
-            "institution":  institution,
-            "plan":         "student_demo",
-            "features":     [
-                "mwm_full", "ymaze", "oft", "heatmap",
-                "png_export", "probe_trial", "learning_curve",
-                "trajectory", "csv_export",
-            ],
-            "seats":        1,
-            "created_at":   datetime.utcnow().isoformat(),
-            "expires_at":   expires_at,
-            "duration_days":duration_days,
-            "ref":          "DEMO-" + secrets.token_hex(4).upper(),
-            "active":       True,
-            "activations":  [],
-            "is_demo":      True,
-        }
+    .login-input:focus { border-color: var(--gold-m); }
 
-        log.info(f"[Demo] Generated {license_key} for {email} — expires {expires_at}")
+    .btn-login {
+      width: 100%; background: var(--gold); color: var(--bg);
+      border: none; border-radius: 8px; padding: 12px;
+      font-family: 'IBM Plex Mono', monospace; font-size: 11px;
+      font-weight: 600; letter-spacing: 0.1em; cursor: pointer;
+      transition: all 0.2s;
+    }
 
-        # Try email — don't crash if it fails
-        email_sent = False
-        try:
-            email_sent = send_demo_email(email, name, institution, license_key, duration_days, expires_at)
-        except Exception as e:
-            log.error(f"[Demo Email] Failed: {e}")
+    .btn-login:hover { background: #e8c96a; }
+    .btn-login:disabled { opacity: 0.6; cursor: not-allowed; }
 
-        return jsonify({
-            "license_key":   license_key,
-            "email":         email,
-            "expires_at":    expires_at,
-            "duration_days": duration_days,
-            "plan":          "student_demo",
-            "email_sent":    email_sent,
-        }), 200
+    .login-error {
+      color: var(--red); font-size: 10px; margin-top: 10px; display: none;
+      background: #ff6b6b11;
+      padding: 12px;
+      border-radius: 8px;
+      text-align: left;
+      line-height: 1.5;
+    }
 
-    except Exception as e:
-        log.error(f"[Demo] Error: {e}")
-        return jsonify({"error": str(e)}), 500
+    .dashboard { display: none; min-height: 100vh; }
 
-@app.route("/admin/demo/bulk", methods=["POST"])
-@require_admin
-def admin_demo_bulk():
-    """Generate demo licenses for multiple students at once"""
-    try:
-        data         = request.get_json()
-        if not data:
-            return jsonify({"error": "No JSON data received"}), 400
+    .topbar {
+      background: var(--surface); border-bottom: 1px solid var(--border);
+      padding: 0 32px; height: 60px;
+      display: flex; align-items: center; justify-content: space-between;
+      position: sticky; top: 0; z-index: 100;
+    }
 
-        students     = data.get("students", [])
-        institution  = data.get("institution", "University of Ilorin")
-        duration_days= int(data.get("duration_days", 30))
-        duration_days= min(max(duration_days, 1), 90)
+    .topbar-brand { display: flex; align-items: center; gap: 10px; }
+    .topbar-brand-text { font-size: 13px; font-weight: 600; color: var(--gold); letter-spacing: 0.1em; }
+    .topbar-brand-text span { color: var(--text); }
+    .topbar-sub { font-size: 8px; color: var(--muted); letter-spacing: 0.2em; }
 
-        if not students:
-            return jsonify({"error": "No students provided"}), 400
+    .topbar-right { display: flex; align-items: center; gap: 12px; }
 
-        results = []
-        for student in students:
-            email = student.get("email", "").strip()
-            name  = student.get("name", "Student").strip()
-            if not email:
-                continue
+    .topbar-stat {
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 8px; padding: 6px 14px; text-align: center;
+    }
 
-            try:
-                license_key = generate_license_key("student")
-                while license_key in LICENSE_DB:
-                    license_key = generate_license_key("student")
+    .topbar-stat-val { font-size: 16px; font-weight: 700; color: var(--gold); line-height: 1; }
+    .topbar-stat-label { font-size: 7px; color: var(--muted); letter-spacing: 0.1em; margin-top: 2px; }
 
-                expires_at = (datetime.utcnow() + timedelta(days=duration_days)).isoformat()
+    .btn-logout {
+      background: none; border: 1px solid var(--border);
+      color: var(--muted); border-radius: 6px; padding: 6px 14px;
+      font-family: 'IBM Plex Mono', monospace; font-size: 9px;
+      cursor: pointer; transition: all 0.2s;
+    }
 
-                LICENSE_DB[license_key] = {
-                    "key":          license_key,
-                    "email":        email,
-                    "name":         name,
-                    "institution":  institution,
-                    "plan":         "student_demo",
-                    "features":     [
-                        "mwm_full","ymaze","oft","heatmap",
-                        "png_export","probe_trial","learning_curve",
-                        "trajectory","csv_export",
-                    ],
-                    "seats":        1,
-                    "created_at":   datetime.utcnow().isoformat(),
-                    "expires_at":   expires_at,
-                    "duration_days":duration_days,
-                    "ref":          "DEMO-" + secrets.token_hex(4).upper(),
-                    "active":       True,
-                    "activations":  [],
-                    "is_demo":      True,
-                }
+    .btn-logout:hover { border-color: var(--red); color: var(--red); }
 
-                # Try email — don't crash if it fails
-                try:
-                    send_demo_email(email, name, institution, license_key, duration_days, expires_at)
-                except Exception as e:
-                    log.error(f"[Bulk Email] Failed for {email}: {e}")
+    .content { padding: 28px 32px; max-width: 1200px; margin: 0 auto; }
 
-                results.append({
-                    "email":       email,
-                    "name":        name,
-                    "license_key": license_key,
-                    "expires_at":  expires_at,
-                })
-                log.info(f"[Demo Bulk] {license_key} → {email}")
+    .tabs {
+      display: flex; gap: 4px; background: var(--surface);
+      border: 1px solid var(--border); border-radius: 10px;
+      padding: 4px; margin-bottom: 28px; width: fit-content;
+      flex-wrap: wrap;
+    }
 
-            except Exception as e:
-                log.error(f"[Bulk] Failed for {email}: {e}")
-                continue
+    .tab {
+      padding: 8px 20px; border-radius: 7px; border: none;
+      font-family: 'IBM Plex Mono', monospace; font-size: 10px;
+      font-weight: 600; letter-spacing: 0.05em; cursor: pointer;
+      transition: all 0.2s; background: transparent; color: var(--muted);
+    }
 
-        return jsonify({
-            "generated": len(results),
-            "licenses":  results,
-        }), 200
+    .tab.active { background: var(--gold); color: var(--bg); }
 
-    except Exception as e:
-        log.error(f"[Bulk] Error: {e}")
-        return jsonify({"error": str(e)}), 500
+    .card {
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 12px; padding: 24px; margin-bottom: 20px;
+    }
 
-@app.route("/admin/revoke", methods=["POST"])
-@require_admin
-def revoke_license():
-    """Revoke a license key"""
-    key     = request.get_json().get("key", "").upper()
-    license = LICENSE_DB.get(key)
-    if not license:
-        return jsonify({"error": "License not found"}), 404
-    license["active"] = False
-    return jsonify({"revoked": key}), 200
+    .card-title {
+      font-size: 11px; letter-spacing: 0.15em; text-transform: uppercase;
+      color: var(--gold); margin-bottom: 20px;
+      display: flex; align-items: center; gap: 8px;
+    }
 
-@app.route("/admin/stats", methods=["GET"])
-@require_admin
-def stats():
-    """Dashboard stats"""
-    plans_count = {}
-    for lic in LICENSE_DB.values():
-        p = lic["plan"]
-        plans_count[p] = plans_count.get(p, 0) + 1
+    .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .form-group { display: flex; flex-direction: column; gap: 6px; }
+    .form-group.full { grid-column: 1 / -1; }
 
-    revenue_ngn = sum(
-        PLANS[lic["plan"]]["ngn"]
-        for lic in LICENSE_DB.values()
-        if lic.get("active") and lic["plan"] in PLANS
-    )
+    .form-label { font-size: 9px; letter-spacing: 0.15em; text-transform: uppercase; color: var(--muted); }
 
-    revenue_usd = sum(
-        PLANS[lic["plan"]]["usd"]
-        for lic in LICENSE_DB.values()
-        if lic.get("active") and lic["plan"] in PLANS
-    )
+    .form-input, .form-select, .form-textarea {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 8px; padding: 10px 14px; color: var(--text);
+      font-family: 'IBM Plex Mono', monospace; font-size: 12px;
+      outline: none; transition: border-color 0.2s; width: 100%;
+    }
 
-    return jsonify({
-        "total_licenses":    len(LICENSE_DB),
-        "active":            sum(1 for l in LICENSE_DB.values() if l.get("active")),
-        "by_plan":           plans_count,
-        "total_revenue_ngn": revenue_ngn,
-        "total_revenue_usd": revenue_usd,
-    }), 200
+    .form-input:focus, .form-select:focus { border-color: var(--gold-m); }
+    .form-select option { background: var(--panel); }
+    .form-textarea { resize: vertical; min-height: 80px; }
 
-# ── Run ───────────────────────────────────────────────────────────────────────
+    .btn-primary {
+      background: var(--gold); color: var(--bg); border: none;
+      border-radius: 8px; padding: 11px 24px;
+      font-family: 'IBM Plex Mono', monospace; font-size: 11px;
+      font-weight: 600; letter-spacing: 0.08em; cursor: pointer;
+      transition: all 0.2s; display: inline-flex; align-items: center; gap: 8px;
+    }
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    log.info(f"[License Server] Starting on port {port}")
-    app.run(host="0.0.0.0", port=port, debug=False)
+    .btn-primary:hover { background: #e8c96a; }
+    .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .btn-outline {
+      background: transparent; color: var(--gold);
+      border: 1px solid var(--gold-m); border-radius: 8px; padding: 8px 18px;
+      font-family: 'IBM Plex Mono', monospace; font-size: 10px;
+      font-weight: 600; cursor: pointer; transition: all 0.2s;
+    }
+
+    .btn-outline:hover { background: var(--gold-d); }
+
+    .btn-danger {
+      background: transparent; color: var(--red);
+      border: 1px solid #ff6b6b44; border-radius: 6px; padding: 5px 12px;
+      font-family: 'IBM Plex Mono', monospace; font-size: 9px;
+      cursor: pointer; transition: all 0.2s;
+    }
+
+    .btn-danger:hover { background: #ff6b6b22; }
+
+    .result-box {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 8px; padding: 16px; margin-top: 16px;
+      display: none; font-size: 11px; line-height: 1.8;
+    }
+
+    .result-box.success { border-color: var(--green); background: #00f5c411; }
+    .result-box.error   { border-color: var(--red);   background: #ff6b6b11; }
+
+    .result-key {
+      font-size: 20px; font-weight: 700; color: var(--gold);
+      letter-spacing: 0.15em; margin: 8px 0;
+      word-break: break-all;
+    }
+
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 10px; }
+    th { text-align: left; padding: 10px 14px; font-size: 8px; letter-spacing: 0.15em; text-transform: uppercase; color: var(--muted); border-bottom: 1px solid var(--border); }
+    td { padding: 12px 14px; border-bottom: 1px solid var(--dim); vertical-align: middle; }
+    tr:hover td { background: var(--surface); }
+
+    .badge {
+      display: inline-block; padding: 2px 8px; border-radius: 4px;
+      font-size: 8px; letter-spacing: 0.08em; font-weight: 600;
+    }
+
+    .badge-active   { background: #00f5c422; color: var(--green); border: 1px solid #00f5c444; }
+    .badge-expired  { background: #ff6b6b22; color: var(--red);   border: 1px solid #ff6b6b44; }
+    .badge-demo     { background: #6c63ff22; color: var(--purple); border: 1px solid #6c63ff44; }
+    .badge-paid     { background: var(--gold-d); color: var(--gold); border: 1px solid var(--gold-m); }
+
+    .days-bar { display: flex; align-items: center; gap: 8px; }
+    .days-track { flex: 1; height: 4px; background: var(--dim); border-radius: 2px; overflow: hidden; }
+    .days-fill { height: 100%; border-radius: 2px; transition: width 0.5s ease; }
+
+    .bulk-help { font-size: 9px; color: var(--muted); line-height: 1.8; margin-bottom: 12px; }
+    .stats-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 24px; }
+    .stat-card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; border-left: 3px solid var(--card-color, var(--gold)); }
+    .stat-val { font-family: 'Cormorant Garamond', serif; font-size: 36px; font-weight: 600; color: var(--card-color, var(--gold)); line-height: 1; }
+    .stat-label { font-size: 9px; color: var(--muted); letter-spacing: 0.1em; margin-top: 4px; }
+
+    .spinner { width: 16px; height: 16px; border: 2px solid transparent; border-top-color: var(--bg); border-radius: 50%; animation: spin 0.6s linear infinite; display: none; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .copy-btn { background: var(--gold-d); border: 1px solid var(--gold-m); color: var(--gold); border-radius: 4px; padding: 3px 8px; font-size: 8px; cursor: pointer; font-family: inherit; transition: all 0.2s; }
+    .copy-btn:hover { background: var(--gold); color: var(--bg); }
+    .empty { text-align: center; padding: 40px; color: var(--muted); font-size: 11px; }
+
+    .notification {
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      background: var(--green);
+      color: var(--bg);
+      padding: 12px 20px;
+      border-radius: 8px;
+      font-size: 12px;
+      font-weight: 600;
+      z-index: 1000;
+      animation: slideIn 0.3s ease;
+    }
+
+    @keyframes slideIn {
+      from { transform: translateX(100%); opacity: 0; }
+      to { transform: translateX(0); opacity: 1; }
+    }
+
+    @media (max-width: 768px) {
+      .content { padding: 16px; }
+      .form-grid { grid-template-columns: 1fr; }
+      .stats-row { grid-template-columns: 1fr 1fr; }
+      .topbar { padding: 0 16px; }
+      .tabs { width: 100%; }
+      .tab { flex: 1; text-align: center; }
+    }
+  </style>
+</head>
+<body>
+
+<div class="login-screen" id="loginScreen">
+  <div class="login-box">
+    <div class="login-logo">🧠</div>
+    <div class="login-title">Admin Dashboard</div>
+    <div class="login-sub">NEUROMATRIX BIOSYSTEMS · LICENSE MANAGEMENT</div>
+    <input class="login-input" id="serverUrl" type="text"
+      placeholder="https://neuromatrix-license.onrender.com"
+      value="https://neuromatrix-license.onrender.com" />
+    <input class="login-input" id="adminSecret" type="password"
+      placeholder="Admin Secret Key"
+      onkeydown="if(event.key==='Enter') login()" />
+    <button class="btn-login" onclick="login()">Access Dashboard →</button>
+    <div class="login-error" id="loginError"></div>
+  </div>
+</div>
+
+<div class="dashboard" id="dashboard">
+  <div class="topbar">
+    <div class="topbar-brand">
+      <div>
+        <div class="topbar-brand-text">NEURO<span>MATRIX</span></div>
+        <div class="topbar-sub">LICENSE ADMIN DASHBOARD</div>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <div class="topbar-stat"><div class="topbar-stat-val" id="statTotal">—</div><div class="topbar-stat-label">TOTAL</div></div>
+      <div class="topbar-stat"><div class="topbar-stat-val" id="statActive" style="color:var(--green)">—</div><div class="topbar-stat-label">ACTIVE</div></div>
+      <div class="topbar-stat"><div class="topbar-stat-val" id="statRevenue" style="color:var(--gold)">—</div><div class="topbar-stat-label">REVENUE ₦</div></div>
+      <button class="btn-logout" onclick="logout()">Sign Out</button>
+    </div>
+  </div>
+
+  <div class="content">
+    <div class="tabs">
+      <button class="tab active" onclick="showTab('generate', this)">🎓 Generate Demo</button>
+      <button class="tab" onclick="showTab('bulk', this)">👥 Bulk Demo</button>
+      <button class="tab" onclick="showTab('manual', this)">🔑 Manual License</button>
+      <button class="tab" onclick="showTab('licenses', this)">📋 All Licenses</button>
+      <button class="tab" onclick="showTab('stats', this)">📊 Stats</button>
+    </div>
+
+    <div id="tab-generate">
+      <div class="card">
+        <div class="card-title">🎓 Generate Student Demo License</div>
+        <div class="form-grid">
+          <div class="form-group"><label class="form-label">Student Full Name</label><input class="form-input" id="demoName" type="text" placeholder="e.g. Aisha Mohammed" /></div>
+          <div class="form-group"><label class="form-label">Student Email</label><input class="form-input" id="demoEmail" type="email" placeholder="student@unilorin.edu.ng" /></div>
+          <div class="form-group"><label class="form-label">Institution</label><input class="form-input" id="demoInstitution" type="text" value="University of Ilorin" /></div>
+          <div class="form-group"><label class="form-label">Duration</label><select class="form-select" id="demoDuration"><option value="30">30 days — 1 month</option><option value="60">60 days — 2 months</option><option value="90">90 days — 3 months (max)</option></select></div>
+        </div>
+        <br/>
+        <button class="btn-primary" id="btnGenDemo" onclick="generateDemo()"><div class="spinner" id="spinDemo"></div>Generate & Email License →</button>
+        <div class="result-box" id="demoResult">
+          <div style="font-size:9px;color:var(--green);letter-spacing:0.1em;margin-bottom:8px;">✅ DEMO LICENSE GENERATED</div>
+          <div style="font-size:10px;color:var(--muted);margin-bottom:4px;">License Key:</div>
+          <div class="result-key" id="demoKeyDisplay">—</div>
+          <button class="copy-btn" onclick="copyKey('demoKeyDisplay')">Copy Key</button>
+          <div style="margin-top:12px;font-size:10px;color:var(--muted);" id="demoDetails"></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="tab-bulk" style="display:none">
+      <div class="card">
+        <div class="card-title">👥 Bulk Demo Licenses — Multiple Students</div>
+        <div class="bulk-help">Enter one student per line in format: <strong style="color:var(--gold)">email, name</strong><br/>Example:<br/>aisha@unilorin.edu.ng, Aisha Mohammed<br/>bola@unilorin.edu.ng, Bola Adeyemi</div>
+        <div class="form-grid">
+          <div class="form-group"><label class="form-label">Institution</label><input class="form-input" id="bulkInstitution" type="text" value="University of Ilorin" /></div>
+          <div class="form-group"><label class="form-label">Duration</label><select class="form-select" id="bulkDuration"><option value="30">30 days</option><option value="60">60 days</option><option value="90">90 days</option></select></div>
+          <div class="form-group full"><label class="form-label">Students (one per line: email, name)</label><textarea class="form-textarea" id="bulkStudents" rows="6" placeholder="student1@unilorin.edu.ng, Aisha Mohammed&#10;student2@unilorin.edu.ng, Bola Adeyemi"></textarea></div>
+        </div>
+        <br/><button class="btn-primary" id="btnBulk" onclick="generateBulk()"><div class="spinner" id="spinBulk"></div>Generate All & Send Emails →</button>
+        <div class="result-box" id="bulkResult"><div style="font-size:9px;color:var(--green);letter-spacing:0.1em;margin-bottom:12px;">✅ BULK LICENSES GENERATED</div><div id="bulkDetails"></div></div>
+      </div>
+    </div>
+
+    <div id="tab-manual" style="display:none">
+      <div class="card">
+        <div class="card-title">🔑 Manual License — For Bank Transfers</div>
+        <div class="form-grid">
+          <div class="form-group"><label class="form-label">Full Name</label><input class="form-input" id="manualName" type="text" placeholder="Dr. Jane Smith" /></div>
+          <div class="form-group"><label class="form-label">Email</label><input class="form-input" id="manualEmail" type="email" placeholder="researcher@university.edu" /></div>
+          <div class="form-group"><label class="form-label">Institution</label><input class="form-input" id="manualInstitution" type="text" placeholder="University name" /></div>
+          <div class="form-group"><label class="form-label">Plan</label><select class="form-select" id="manualPlan"><option value="student">Student — $29 / ₦49,000</option><option value="researcher" selected>Researcher — $49 / ₦79,000</option><option value="institution">Institution — $89 / ₦149,000</option></select></div>
+        </div>
+        <br/><button class="btn-primary" id="btnManual" onclick="generateManual()"><div class="spinner" id="spinManual"></div>Generate & Email License →</button>
+        <div class="result-box" id="manualResult"><div style="font-size:9px;color:var(--green);letter-spacing:0.1em;margin-bottom:8px;">✅ LICENSE GENERATED</div><div style="font-size:10px;color:var(--muted);margin-bottom:4px;">License Key:</div><div class="result-key" id="manualKeyDisplay">—</div><button class="copy-btn" onclick="copyKey('manualKeyDisplay')">Copy Key</button><div style="margin-top:12px;font-size:10px;color:var(--muted);" id="manualDetails"></div></div>
+      </div>
+    </div>
+
+    <div id="tab-licenses" style="display:none">
+      <div class="card">
+        <div class="card-title" style="justify-content:space-between; flex-wrap:wrap; gap:10px;"><span>📋 All Licenses</span><div style="display:flex;gap:8px;"><input class="form-input" id="searchLic" type="text" placeholder="Search..." style="width:200px;padding:6px 12px;font-size:10px;" oninput="filterLicenses()" /><button class="btn-outline" onclick="loadLicenses()" style="padding:6px 14px;">↻ Refresh</button></div></div>
+        <div class="table-wrap"><table><thead><tr><th>License Key</th><th>Name</th><th>Email</th><th>Plan</th><th>Status</th><th>Expires</th><th>Action</th></tr></thead><tbody id="licenseTable"><tr><td colspan="7" class="empty">Loading licenses...</td></tr></tbody></table></div>
+      </div>
+    </div>
+
+    <div id="tab-stats" style="display:none">
+      <div class="stats-row"><div class="stat-card" style="--card-color:var(--gold)"><div class="stat-val" id="s-total">—</div><div class="stat-label">TOTAL LICENSES</div></div><div class="stat-card" style="--card-color:var(--green)"><div class="stat-val" id="s-active">—</div><div class="stat-label">ACTIVE</div></div><div class="stat-card" style="--card-color:var(--purple)"><div class="stat-val" id="s-demo">—</div><div class="stat-label">DEMO LICENSES</div></div><div class="stat-card" style="--card-color:var(--blue)"><div class="stat-val" id="s-revenue">—</div><div class="stat-label">REVENUE (USD)</div></div></div>
+      <div class="card"><div class="card-title">📊 Revenue by Plan</div><div id="planBreakdown" style="font-size:11px;color:var(--muted);line-height:2.5;">Loading...</div></div>
+    </div>
+  </div>
+</div>
+
+<script>
+  let API = '', SECRET = '', allLicenses = [];
+
+  function showNotification(message, isError = false) {
+    const notification = document.createElement('div');
+    notification.className = 'notification';
+    notification.style.background = isError ? 'var(--red)' : 'var(--green)';
+    notification.style.color = 'var(--bg)';
+    notification.textContent = message;
+    document.body.appendChild(notification);
+    setTimeout(() => notification.remove(), 3000);
+  }
+
+  async function apiFetch(endpoint, options = {}) {
+    const response = await fetch(`${API}${endpoint}`, {
+      headers: { 'X-Admin-Secret': SECRET, 'Content-Type': 'application/json' },
+      mode: 'cors',
+      ...options
+    });
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(error.error || `HTTP ${response.status}`);
+    }
+    return response.json();
+  }
+
+  async function login() {
+    API = document.getElementById('serverUrl').value.trim().replace(/\/$/, '');
+    SECRET = document.getElementById('adminSecret').value.trim();
+    const errDiv = document.getElementById('loginError');
+    const btn = document.querySelector('.btn-login');
+    errDiv.style.display = 'none';
+    btn.disabled = true;
+    btn.textContent = 'Connecting...';
+
+    try {
+      const data = await apiFetch('/admin/stats');
+      document.getElementById('loginScreen').style.display = 'none';
+      document.getElementById('dashboard').style.display = 'block';
+      updateTopStats(data);
+      await loadLicenses();
+      btn.disabled = false;
+      btn.textContent = 'Access Dashboard →';
+      showNotification('✅ Login successful!');
+    } catch (error) {
+      errDiv.innerHTML = `❌ ${error.message}`;
+      errDiv.style.display = 'block';
+      btn.disabled = false;
+      btn.textContent = 'Access Dashboard →';
+    }
+  }
+
+  function logout() {
+    SECRET = ''; API = '';
+    document.getElementById('loginScreen').style.display = 'flex';
+    document.getElementById('dashboard').style.display = 'none';
+    document.getElementById('adminSecret').value = '';
+  }
+
+  function showTab(name, btn) {
+    document.querySelectorAll('[id^="tab-"]').forEach(t => t.style.display = 'none');
+    document.getElementById('tab-' + name).style.display = 'block';
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    btn.classList.add('active');
+    if (name === 'licenses') loadLicenses();
+    if (name === 'stats') loadStats();
+  }
+
+  function copyKey(id) {
+    const key = document.getElementById(id).textContent;
+    if (key && key !== '—') {
+      navigator.clipboard.writeText(key);
+      showNotification('📋 License key copied!');
+    }
+  }
+
+  async function generateDemo() {
+    const name = document.getElementById('demoName').value.trim();
+    const email = document.getElementById('demoEmail').value.trim();
+    const inst = document.getElementById('demoInstitution').value.trim();
+    const duration = document.getElementById('demoDuration').value;
+    const btn = document.getElementById('btnGenDemo');
+    const spin = document.getElementById('spinDemo');
+    const result = document.getElementById('demoResult');
+
+    if (!name || !email) {
+      showNotification('Please enter name and email', true);
+      return;
+    }
+
+    btn.disabled = true;
+    spin.style.display = 'inline-block';
+    result.style.display = 'none';
+
+    try {
+      const data = await apiFetch('/admin/demo', {
+        method: 'POST',
+        body: JSON.stringify({ name, email, institution: inst, duration_days: parseInt(duration) })
+      });
+
+      document.getElementById('demoKeyDisplay').textContent = data.license_key;
+      document.getElementById('demoDetails').innerHTML = `
+        <strong>Student:</strong> ${escapeHtml(name)}<br/>
+        <strong>Email:</strong> ${escapeHtml(email)}<br/>
+        <strong>Duration:</strong> ${duration} days<br/>
+        <strong>Expires:</strong> ${new Date(data.expires_at).toLocaleDateString()}<br/>
+        <strong style="color:var(--green)">✅ License generated and emailed!</strong>
+      `;
+      result.className = 'result-box success';
+      result.style.display = 'block';
+
+      document.getElementById('demoName').value = '';
+      document.getElementById('demoEmail').value = '';
+
+      // CRITICAL FIX: Refresh licenses immediately after generation
+      await loadLicenses();
+      await refreshTopStats();
+      
+      showNotification(`✅ License generated for ${name}!`);
+
+      // Auto-switch to licenses tab to show the new license
+      const licensesTab = document.querySelector('.tab[onclick*="licenses"]');
+      if (licensesTab) {
+        setTimeout(() => {
+          showTab('licenses', licensesTab);
+        }, 1500);
+      }
+
+    } catch (error) {
+      result.innerHTML = `❌ Error: ${escapeHtml(error.message)}`;
+      result.className = 'result-box error';
+      result.style.display = 'block';
+      showNotification(error.message, true);
+    } finally {
+      btn.disabled = false;
+      spin.style.display = 'none';
+    }
+  }
+
+  async function generateBulk() {
+    const raw = document.getElementById('bulkStudents').value.trim();
+    const inst = document.getElementById('bulkInstitution').value.trim();
+    const dur = document.getElementById('bulkDuration').value;
+    const btn = document.getElementById('btnBulk');
+    const spin = document.getElementById('spinBulk');
+    const result = document.getElementById('bulkResult');
+
+    if (!raw) {
+      showNotification('Please enter student list', true);
+      return;
+    }
+
+    const students = raw.split('\n').map(line => {
+      const idx = line.indexOf(',');
+      if (idx === -1) return null;
+      const email = line.substring(0, idx).trim();
+      const name = line.substring(idx + 1).trim();
+      return email && email.includes('@') ? { email, name: name || 'Student' } : null;
+    }).filter(s => s);
+
+    if (!students.length) {
+      showNotification('No valid students found. Format: email, name', true);
+      return;
+    }
+
+    if (!confirm(`Generate ${students.length} demo licenses for ${dur} days?`)) return;
+
+    btn.disabled = true;
+    spin.style.display = 'inline-block';
+    result.style.display = 'none';
+
+    try {
+      const data = await apiFetch('/admin/demo/bulk', {
+        method: 'POST',
+        body: JSON.stringify({ students, institution: inst, duration_days: parseInt(dur) })
+      });
+
+      let html = `<div style="color:var(--green);margin-bottom:12px;">✅ Generated ${data.generated} licenses — emails sent!</div>`;
+      html += '<table style="width:100%;font-size:10px;border-collapse:collapse;">';
+      html += '<tr><th style="text-align:left;padding:6px;">Name</th><th style="text-align:left;padding:6px;">Email</th><th style="text-align:left;padding:6px;">Key</th></tr>';
+      data.licenses.forEach(l => {
+        html += `<tr>
+          <td style="padding:6px;">${escapeHtml(l.name)}</td>
+          <td style="padding:6px;">${escapeHtml(l.email)}</td>
+          <td style="padding:6px;"><span style="color:var(--gold);">${escapeHtml(l.license_key)}</span>
+          <button class="copy-btn" onclick="navigator.clipboard.writeText('${escapeHtml(l.license_key).replace(/'/g, "\\'")}')">Copy</button></td>
+        </tr>`;
+      });
+      html += '</table>';
+
+      document.getElementById('bulkDetails').innerHTML = html;
+      result.className = 'result-box success';
+      result.style.display = 'block';
+      document.getElementById('bulkStudents').value = '';
+
+      await loadLicenses();
+      await refreshTopStats();
+      
+      showNotification(`✅ Generated ${data.generated} licenses!`);
+
+    } catch (error) {
+      result.innerHTML = `❌ Error: ${escapeHtml(error.message)}`;
+      result.className = 'result-box error';
+      result.style.display = 'block';
+      showNotification(error.message, true);
+    } finally {
+      btn.disabled = false;
+      spin.style.display = 'none';
+    }
+  }
+
+  async function generateManual() {
+    const name = document.getElementById('manualName').value.trim();
+    const email = document.getElementById('manualEmail').value.trim();
+    const inst = document.getElementById('manualInstitution').value.trim();
+    const plan = document.getElementById('manualPlan').value;
+    const btn = document.getElementById('btnManual');
+    const spin = document.getElementById('spinManual');
+    const result = document.getElementById('manualResult');
+
+    if (!name || !email) {
+      showNotification('Please enter name and email', true);
+      return;
+    }
+
+    btn.disabled = true;
+    spin.style.display = 'inline-block';
+    result.style.display = 'none';
+
+    try {
+      const data = await apiFetch('/admin/generate', {
+        method: 'POST',
+        body: JSON.stringify({ name, email, institution: inst, plan })
+      });
+
+      document.getElementById('manualKeyDisplay').textContent = data.license_key;
+      document.getElementById('manualDetails').innerHTML = `
+        <strong>Name:</strong> ${escapeHtml(name)}<br/>
+        <strong>Email:</strong> ${escapeHtml(email)}<br/>
+        <strong>Plan:</strong> ${escapeHtml(plan)}<br/>
+        <strong style="color:var(--green)">✅ License generated and emailed!</strong>
+      `;
+      result.className = 'result-box success';
+      result.style.display = 'block';
+
+      document.getElementById('manualName').value = '';
+      document.getElementById('manualEmail').value = '';
+
+      await loadLicenses();
+      await refreshTopStats();
+      
+      showNotification(`✅ License generated for ${name}!`);
+
+    } catch (error) {
+      result.innerHTML = `❌ Error: ${escapeHtml(error.message)}`;
+      result.className = 'result-box error';
+      result.style.display = 'block';
+      showNotification(error.message, true);
+    } finally {
+      btn.disabled = false;
+      spin.style.display = 'none';
+    }
+  }
+
+  async function loadLicenses() {
+    try {
+      const data = await apiFetch('/admin/licenses');
+      allLicenses = data.licenses || [];
+      renderTable(allLicenses);
+    } catch (error) {
+      document.getElementById('licenseTable').innerHTML = `<tr><td colspan="7" class="empty">❌ Failed to load: ${escapeHtml(error.message)}</td></tr>`;
+    }
+  }
+
+  function filterLicenses() {
+    const query = document.getElementById('searchLic').value.toLowerCase();
+    const filtered = allLicenses.filter(l =>
+      (l.email || '').toLowerCase().includes(query) ||
+      (l.key || '').toLowerCase().includes(query) ||
+      (l.name || '').toLowerCase().includes(query)
+    );
+    renderTable(filtered);
+  }
+
+  function renderTable(licenses) {
+    const tbody = document.getElementById('licenseTable');
+    if (!licenses.length) {
+      tbody.innerHTML = '<tr><td colspan="7" class="empty">No licenses found</td></tr>';
+      return;
+    }
+
+    tbody.innerHTML = licenses.map(l => {
+      const isDemo = l.is_demo || l.plan === 'student_demo';
+      const isExpired = l.expires_at && new Date(l.expires_at) < new Date();
+      const isActive = l.active && !isExpired;
+
+      let expiryHtml = '<span style="color:var(--muted)">Lifetime</span>';
+      if (l.expires_at) {
+        const exp = new Date(l.expires_at);
+        const created = new Date(l.created_at);
+        const total = (exp - created) / 86400000;
+        const left = Math.max(0, (exp - new Date()) / 86400000);
+        const pct = total > 0 ? Math.min(100, Math.round((left / total) * 100)) : 0;
+        const color = pct > 50 ? 'var(--green)' : pct > 20 ? 'var(--gold)' : 'var(--red)';
+        expiryHtml = `
+          <div class="days-bar">
+            <div class="days-track">
+              <div class="days-fill" style="width:${pct}%;background:${color}"></div>
+            </div>
+            <span style="color:${color};">${isExpired ? 'Expired' : Math.round(left) + 'd left'}</span>
+          </div>`;
+      }
+
+      const statusBadge = !l.active ? '<span class="badge badge-expired">Revoked</span>' :
+                          isExpired ? '<span class="badge badge-expired">Expired</span>' :
+                          isDemo ? '<span class="badge badge-demo">Demo</span>' :
+                          '<span class="badge badge-paid">Active</span>';
+
+      return `<tr>
+        <td><span style="color:var(--gold);">${escapeHtml(l.key)}</span>
+          <button class="copy-btn" onclick="navigator.clipboard.writeText('${escapeHtml(l.key).replace(/'/g, "\\'")}')">Copy</button>
+        </td>
+        <td>${escapeHtml(l.name || '—')}</td>
+        <td>${escapeHtml(l.email || '—')}</td>
+        <td><span class="badge" style="background:var(--gold-d);color:var(--gold);">${escapeHtml(l.plan)}</span></td>
+        <td>${statusBadge}</td>
+        <td>${expiryHtml}</td>
+        <td>${isActive ? `<button class="btn-danger" onclick="revokeLicense('${escapeHtml(l.key).replace(/'/g, "\\'")}')">Revoke</button>` : '—'}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  async function revokeLicense(key) {
+    if (!confirm(`Revoke license ${key}?`)) return;
+    try {
+      await apiFetch('/admin/revoke', { method: 'POST', body: JSON.stringify({ key }) });
+      await loadLicenses();
+      await refreshTopStats();
+      showNotification(`License ${key} revoked`);
+    } catch (error) {
+      showNotification(error.message, true);
+    }
+  }
+
+  async function loadStats() {
+    try {
+      const data = await apiFetch('/admin/stats');
+      document.getElementById('s-total').textContent = data.total_licenses || 0;
+      document.getElementById('s-active').textContent = data.active || 0;
+      document.getElementById('s-revenue').textContent = '$' + (data.total_revenue_usd || 0);
+      
+      const demo = Object.entries(data.by_plan || {})
+        .filter(([k]) => k.includes('demo'))
+        .reduce((a, [, v]) => a + v, 0);
+      document.getElementById('s-demo').textContent = demo;
+
+      let breakdown = '';
+      Object.entries(data.by_plan || {}).forEach(([plan, count]) => {
+        const pct = data.total_licenses > 0 ? (count / data.total_licenses) * 100 : 0;
+        breakdown += `<div style="display:flex;align-items:center;gap:12px;padding:6px 0;border-bottom:1px solid var(--dim);">
+          <span style="width:140px;">${escapeHtml(plan)}</span>
+          <div style="flex:1;background:var(--dim);height:6px;">
+            <div style="width:${pct}%;background:var(--gold);height:100%;"></div>
+          </div>
+          <span style="color:var(--gold);">${count}</span>
+        </div>`;
+      });
+      document.getElementById('planBreakdown').innerHTML = breakdown || 'No data yet';
+      updateTopStats(data);
+    } catch (error) {
+      document.getElementById('planBreakdown').innerHTML = `<span style="color:var(--red)">Error: ${escapeHtml(error.message)}</span>`;
+    }
+  }
+
+  function updateTopStats(data) {
+    document.getElementById('statTotal').textContent = data.total_licenses || 0;
+    document.getElementById('statActive').textContent = data.active || 0;
+    document.getElementById('statRevenue').textContent = '₦' + (data.total_revenue_ngn || 0).toLocaleString();
+  }
+
+  async function refreshTopStats() {
+    try {
+      const data = await apiFetch('/admin/stats');
+      updateTopStats(data);
+    } catch (error) {}
+  }
+
+  function escapeHtml(str) {
+    if (!str) return '';
+    return str.replace(/[&<>]/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[m]));
+  }
+</script>
+</body>
+</html>
