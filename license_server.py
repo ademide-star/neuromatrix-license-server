@@ -367,7 +367,7 @@
     <div id="tab-licenses" style="display:none">
       <div class="card">
         <div class="card-title" style="justify-content:space-between; flex-wrap:wrap; gap:10px;"><span>📋 All Licenses</span><div style="display:flex;gap:8px;"><input class="form-input" id="searchLic" type="text" placeholder="Search..." style="width:200px;padding:6px 12px;font-size:10px;" oninput="filterLicenses()" /><button class="btn-outline" onclick="loadLicenses()" style="padding:6px 14px;">↻ Refresh</button></div></div>
-        <div class="table-wrap"><table><thead><tr><th>License Key</th><th>Name</th><th>Email</th><th>Plan</th><th>Status</th><th>Expires</th><th>Action</th></tr></thead><tbody id="licenseTable"><tr><td colspan="7" class="empty">Loading licenses...</td></tr></tbody></table></div>
+        <div class="table-wrap"><table><thead><tr><th>License Key</th><th>Name</th><th>Email</th><th>Plan</th><th>Status</th><th>Expires</th><th>Action</th></tr></thead><tbody id="licenseTable"><tr><td colspan="7" class="empty">Loading licenses......</td></tr></tbody></table>
       </div>
     </div>
 
@@ -388,20 +388,43 @@
     notification.style.color = 'var(--bg)';
     notification.textContent = message;
     document.body.appendChild(notification);
-    setTimeout(() => notification.remove(), 3000);
+    setTimeout(() => notification.remove(), 4000);
   }
 
   async function apiFetch(endpoint, options = {}) {
-    const response = await fetch(`${API}${endpoint}`, {
-      headers: { 'X-Admin-Secret': SECRET, 'Content-Type': 'application/json' },
-      mode: 'cors',
-      ...options
-    });
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({}));
-      throw new Error(error.error || `HTTP ${response.status}`);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
+    
+    try {
+      const response = await fetch(`${API}${endpoint}`, {
+        headers: { 
+          'X-Admin-Secret': SECRET, 
+          'Content-Type': 'application/json'
+        },
+        mode: 'cors',
+        signal: controller.signal,
+        ...options
+      });
+      
+      clearTimeout(timeoutId);
+      
+      if (!response.ok) {
+        let errorMsg = `HTTP ${response.status}`;
+        try {
+          const errorData = await response.json();
+          errorMsg = errorData.error || errorData.message || errorMsg;
+        } catch(e) {}
+        throw new Error(errorMsg);
+      }
+      
+      return response.json();
+    } catch (error) {
+      clearTimeout(timeoutId);
+      if (error.name === 'AbortError') {
+        throw new Error('Request timeout - server took too long to respond');
+      }
+      throw error;
     }
-    return response.json();
   }
 
   async function login() {
@@ -475,7 +498,12 @@
     try {
       const data = await apiFetch('/admin/demo', {
         method: 'POST',
-        body: JSON.stringify({ name, email, institution: inst, duration_days: parseInt(duration) })
+        body: JSON.stringify({ 
+          name: name, 
+          email: email, 
+          institution: inst, 
+          duration_days: parseInt(duration) 
+        })
       });
 
       document.getElementById('demoKeyDisplay').textContent = data.license_key;
@@ -492,22 +520,23 @@
       document.getElementById('demoName').value = '';
       document.getElementById('demoEmail').value = '';
 
-      // CRITICAL FIX: Refresh licenses immediately after generation
+      // Refresh everything
       await loadLicenses();
       await refreshTopStats();
       
-      showNotification(`✅ License generated for ${name}!`);
+      showNotification(`✅ Demo license generated for ${name}!`);
 
-      // Auto-switch to licenses tab to show the new license
-      const licensesTab = document.querySelector('.tab[onclick*="licenses"]');
-      if (licensesTab) {
-        setTimeout(() => {
+      // Auto-switch to licenses tab
+      setTimeout(() => {
+        const licensesTab = document.querySelector('.tab[onclick*="licenses"]');
+        if (licensesTab) {
           showTab('licenses', licensesTab);
-        }, 1500);
-      }
+        }
+      }, 1500);
 
     } catch (error) {
-      result.innerHTML = `❌ Error: ${escapeHtml(error.message)}`;
+      console.error('Demo generation error:', error);
+      result.innerHTML = `❌ Error: ${escapeHtml(error.message)}<br/><small>Check console for details</small>`;
       result.className = 'result-box error';
       result.style.display = 'block';
       showNotification(error.message, true);
