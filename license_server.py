@@ -23,7 +23,11 @@ from email.mime.multipart import MIMEMultipart
 from functools import wraps
 
 from flask import Flask, request, jsonify, send_file, abort
+from flask import render_template
 
+@app.route('/admin')
+def admin_panel():
+    return render_template('admin.html')
 # ── Setup ─────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
