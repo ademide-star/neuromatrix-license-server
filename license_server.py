@@ -22,9 +22,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from functools import wraps
 
-from flask import Flask, request, jsonify, send_file, abort
-from flask import render_template
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, request, jsonify, send_file, abort, render_template jsonify, render_template
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
@@ -261,10 +259,6 @@ def health():
         "licenses_issued": len(LICENSE_DB),
     })
 
-@app.route("/admin")
-def admin_panel():
-    """Serve admin dashboard"""
-    return send_file("admin.html")
 
 # ── Paystack webhook ──────────────────────────────────────────────────────────
 
