@@ -24,10 +24,8 @@ from functools import wraps
 
 from flask import Flask, request, jsonify, send_file, abort
 from flask import render_template
+from flask import Flask, request, jsonify, render_template
 
-@app.route('/admin')
-def admin_panel():
-    return render_template('admin.html')
 # ── Setup ─────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
@@ -666,6 +664,16 @@ def stats():
         "total_revenue_usd": revenue_usd,
     }), 200
 
+@app.route('/admin')
+def admin_panel():
+    """Serve the admin dashboard HTML"""
+    from flask import render_template
+    try:
+        return render_template('admin.html')
+    except Exception as e:
+        log.error(f"Failed to render admin.html: {e}")
+        return jsonify({"error": "Admin panel not found"}), 404
+      
 # ── Run ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
