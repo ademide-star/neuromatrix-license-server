@@ -20,9 +20,8 @@ import logging
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from functools import wraps,
-from flask import Flask, request, jsonify, send_file, abort, render_template jsonify, render_template
-
+from functools import wraps
+from flask import Flask, request, jsonify, send_file, abort, render_template
 # ── Setup ─────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
