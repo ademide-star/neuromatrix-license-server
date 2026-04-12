@@ -2,8 +2,7 @@
 NeuroMatrix Biosystems — License Key Backend
 ============================================
 Handles license generation, verification, Paystack webhooks and .exe downloads.
-
-Deploy on Render.com (free tier) as a separate service from server.py
+Deploy on Render.com (free tier) as a separate service.
 
 Requirements:
   pip install flask flask-cors requests python-dotenv cryptography
@@ -17,11 +16,14 @@ import hashlib
 import secrets
 import smtplib
 import logging
+import threading
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from functools import wraps
+
 from flask import Flask, request, jsonify, send_file, abort, render_template
+
 # ── Setup ─────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
@@ -57,7 +59,6 @@ DOWNLOAD_URL         = os.environ.get("DOWNLOAD_URL",         "https://your-down
 ADMIN_SECRET         = os.environ.get("ADMIN_SECRET",         "change-this-secret")
 
 # ── In-memory license store (replace with DB on production) ───────────────────
-# Structure: { "NMBT-XXXX-XXXX-XXXX": { ...license data... } }
 LICENSE_DB = {}
 
 # ── Plan definitions ──────────────────────────────────────────────────────────
@@ -87,29 +88,14 @@ PLANS = {
         "features":      ["mwm_full", "ymaze", "oft", "heatmap", "png_export",
                           "probe_trial", "learning_curve", "trajectory", "csv_export",
                           "multi_seat", "api_access", "custom_branding"],
-        "upgrade_years": None,  # lifetime
+        "upgrade_years": None,
     },
 }
 
-# ── Utils ──────────────────────────────────────────────────────────────────────
-
-def generate_license_key(plan: str) -> str:
-    """Generate a unique license key: NMBT-XXXX-XXXX-XXXX"""
-    prefix = "NMBT"
-    parts  = [secrets.token_hex(2).upper() for _ in range(3)]
-    return f"{prefix}-{parts[0]}-{parts[1]}-{parts[2]}"
-
-def verify_paystack_signature(payload: bytes, signature: str) -> bool:
-    """Verify Paystack webhook signature"""
-    expected = hmac.new(
-        PAYSTACK_SECRET.encode("utf-8"),
-        payload,
-        hashlib.sha512
-    ).hexdigest()
-    return hmac.compare_digest(expected, signature)
+# ── Email sending functions (blocking, used by async wrappers) ────────────────
 
 def send_license_email(email: str, name: str, plan: str, license_key: str):
-    """Send license key email to buyer"""
+    """Send license key email to buyer (blocking)"""
     plan_info = PLANS.get(plan, {})
     subject   = f"🧠 Your NeuroTrack Pro License Key — {plan_info.get('name', plan)}"
 
@@ -184,7 +170,7 @@ def send_license_email(email: str, name: str, plan: str, license_key: str):
         return False
 
 def send_demo_email(email, name, institution, license_key, duration_days, expires_at):
-    """Send demo license email with expiry info to student"""
+    """Send demo license email with expiry info to student (blocking)"""
     expiry_date = datetime.fromisoformat(expires_at).strftime("%B %d, %Y")
     subject     = f"🧠 NeuroTrack Pro — {duration_days}-Day Demo License"
     html = f"""
@@ -246,6 +232,44 @@ def send_demo_email(email, name, institution, license_key, duration_days, expire
         log.error(f"[Demo Email] Failed: {e}")
         return False
 
+# ── Async email wrappers (run in background threads) ──────────────────────────
+
+def send_license_email_async(email, name, plan, license_key):
+    """Send license email in background thread"""
+    try:
+        send_license_email(email, name, plan, license_key)
+    except Exception as e:
+        log.error(f"[Async License Email] Failed for {email}: {e}")
+
+def send_demo_email_async(email, name, institution, license_key, duration_days, expires_at):
+    """Send demo email in background thread"""
+    try:
+        send_demo_email(email, name, institution, license_key, duration_days, expires_at)
+    except Exception as e:
+        log.error(f"[Async Demo Email] Failed for {email}: {e}")
+
+# ── Utility functions ─────────────────────────────────────────────────────────
+
+def generate_license_key(plan: str) -> str:
+    """Generate a unique license key: NMBT-XXXX-XXXX-XXXX"""
+    prefix = "NMBT"
+    parts  = [secrets.token_hex(2).upper() for _ in range(3)]
+    return f"{prefix}-{parts[0]}-{parts[1]}-{parts[2]}"
+
+def verify_paystack_signature(payload: bytes, signature: str) -> bool:
+    """Verify Paystack webhook signature"""
+    expected = hmac.new(
+        PAYSTACK_SECRET.encode("utf-8"),
+        payload,
+        hashlib.sha512
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+def _detect_plan_from_amount(amount: float) -> str:
+    if amount >= 149000: return "institution"
+    if amount >= 79000:  return "researcher"
+    return "student"
+
 # ── ROUTES ────────────────────────────────────────────────────────────────────
 
 @app.route("/")
@@ -257,45 +281,40 @@ def health():
         "licenses_issued": len(LICENSE_DB),
     })
 
-
-# ── Paystack webhook ──────────────────────────────────────────────────────────
+@app.route("/admin")
+def admin_panel():
+    """Serve admin dashboard"""
+    try:
+        return render_template('admin.html')
+    except Exception as e:
+        log.error(f"Failed to render admin.html: {e}")
+        return jsonify({"error": "Admin panel not found"}), 404
 
 @app.route("/webhook/paystack", methods=["POST"])
 def paystack_webhook():
-    """Receives Paystack payment confirmation — generates and emails license key"""
     payload   = request.get_data()
     signature = request.headers.get("X-Paystack-Signature", "")
-
     if not verify_paystack_signature(payload, signature):
         log.warning("[Webhook] Invalid Paystack signature")
         return jsonify({"error": "Invalid signature"}), 401
-
     try:
         event = json.loads(payload)
         log.info(f"[Webhook] Event: {event.get('event')}")
-
         if event.get("event") != "charge.success":
             return jsonify({"status": "ignored"}), 200
-
         data     = event["data"]
         email    = data["customer"]["email"]
-        amount   = data["amount"] / 100  # convert from kobo
+        amount   = data["amount"] / 100
         ref      = data["reference"]
         metadata = data.get("metadata", {})
         fields   = {f["variable_name"]: f["value"] for f in metadata.get("custom_fields", [])}
-
         name        = fields.get("buyer_name", "Researcher")
         institution = fields.get("institution", "")
         plan_key    = _detect_plan_from_amount(amount)
-
         log.info(f"[Webhook] Payment: {email} | {plan_key} | ₦{amount} | ref:{ref}")
-
-        # Generate license key
         license_key = generate_license_key(plan_key)
         while license_key in LICENSE_DB:
             license_key = generate_license_key(plan_key)
-
-        # Store license
         LICENSE_DB[license_key] = {
             "key":         license_key,
             "email":       email,
@@ -309,49 +328,26 @@ def paystack_webhook():
             "active":      True,
             "activations": [],
         }
-
         log.info(f"[License] Generated: {license_key} for {email}")
-
-        # Send email
-        email_sent = send_license_email(email, name, plan_key, license_key)
-        log.info(f"[Email] Sent: {email_sent}")
-
-        return jsonify({
-            "status":      "success",
-            "license_key": license_key,
-            "email_sent":  email_sent,
-        }), 200
-
+        # Send email asynchronously
+        thread = threading.Thread(target=send_license_email_async, args=(email, name, plan_key, license_key))
+        thread.start()
+        return jsonify({"status": "success", "license_key": license_key}), 200
     except Exception as e:
         log.error(f"[Webhook] Error: {e}")
         return jsonify({"error": str(e)}), 500
 
-def _detect_plan_from_amount(amount: float) -> str:
-    """Detect plan from payment amount"""
-    if amount >= 149000:  return "institution"
-    if amount >= 79000:   return "researcher"
-    return "student"
-
-# ── Verify license ────────────────────────────────────────────────────────────
-
 @app.route("/verify", methods=["POST"])
 def verify_license():
-    """Verify a license key — called by App.js on load"""
     data = request.get_json()
     key  = data.get("key", "").strip().upper()
-
     if not key:
         return jsonify({"valid": False, "error": "No key provided"}), 400
-
     license = LICENSE_DB.get(key)
-
     if not license:
         return jsonify({"valid": False, "error": "License not found"}), 404
-
     if not license.get("active"):
         return jsonify({"valid": False, "error": "License deactivated"}), 403
-
-    # ── Check expiry for demo/student licenses ──
     expires_at = license.get("expires_at")
     if expires_at:
         expiry = datetime.fromisoformat(expires_at)
@@ -363,55 +359,43 @@ def verify_license():
                 "error": f"Demo license expired {days_expired} day(s) ago. Purchase a full license at neuromatrixbiosystems.com/pricing",
                 "expired": True,
             }), 403
-
-        # Include days remaining in response
         days_left = (expiry - datetime.utcnow()).days
         license["days_remaining"] = days_left
-
-    # Track activation
     ip = request.remote_addr
     if ip not in license["activations"]:
         if len(license["activations"]) >= license["seats"]:
             return jsonify({
-                "valid":  False,
-                "error":  f"Seat limit reached ({license['seats']} seats). Contact support to add more.",
+                "valid": False,
+                "error": f"Seat limit reached ({license['seats']} seats). Contact support to add more.",
             }), 403
         license["activations"].append(ip)
-
     return jsonify({
-        "valid":         True,
-        "plan":          license["plan"],
-        "features":      license["features"],
-        "seats":         license["seats"],
-        "name":          license["name"],
-        "email":         license["email"],
-        "expires_at":    license.get("expires_at"),
-        "days_remaining":license.get("days_remaining"),
-        "is_demo":       license.get("is_demo", False),
+        "valid": True,
+        "plan": license["plan"],
+        "features": license["features"],
+        "seats": license["seats"],
+        "name": license["name"],
+        "email": license["email"],
+        "expires_at": license.get("expires_at"),
+        "days_remaining": license.get("days_remaining"),
+        "is_demo": license.get("is_demo", False),
     }), 200
-
-# ── Download .exe ─────────────────────────────────────────────────────────────
 
 @app.route("/download", methods=["POST"])
 def download_exe():
-    """Return download link after license verification"""
     data = request.get_json()
     key  = data.get("key", "").strip().upper()
     license = LICENSE_DB.get(key)
-
     if not license or not license.get("active"):
         return jsonify({"error": "Invalid or inactive license"}), 403
-
-    # Return signed download URL
-    # In production: generate a signed S3/Cloudflare URL
     return jsonify({
         "download_url": DOWNLOAD_URL,
-        "expires_in":   "1 hour",
-        "version":      "2.1.0",
-        "filename":     "NeuroTrack-Pro-Setup.exe",
+        "expires_in": "1 hour",
+        "version": "2.1.0",
+        "filename": "NeuroTrack-Pro-Setup.exe",
     }), 200
 
-# ── Admin routes ──────────────────────────────────────────────────────────────
+# ── Admin routes (with async email) ───────────────────────────────────────────
 
 def require_admin(f):
     @wraps(f)
@@ -425,114 +409,100 @@ def require_admin(f):
 @app.route("/admin/licenses", methods=["GET"])
 @require_admin
 def list_licenses():
-    """List all licenses — admin only"""
     return jsonify({
-        "total":    len(LICENSE_DB),
+        "total": len(LICENSE_DB),
         "licenses": list(LICENSE_DB.values()),
     }), 200
 
 @app.route("/admin/generate", methods=["POST"])
 @require_admin
 def admin_generate():
-    """Manually generate a license key — for bank transfers"""
-    data  = request.get_json()
+    """Manually generate a license key — for bank transfers (async email)"""
+    data = request.get_json()
     email = data.get("email")
     name  = data.get("name", "Researcher")
     plan  = data.get("plan", "researcher")
-
     if not email or plan not in PLANS:
         return jsonify({"error": "Invalid email or plan"}), 400
-
     license_key = generate_license_key(plan)
     while license_key in LICENSE_DB:
         license_key = generate_license_key(plan)
-
     LICENSE_DB[license_key] = {
-        "key":         license_key,
-        "email":       email,
-        "name":        name,
+        "key": license_key,
+        "email": email,
+        "name": name,
         "institution": data.get("institution", ""),
-        "plan":        plan,
-        "features":    PLANS[plan]["features"],
-        "seats":       PLANS[plan]["seats"],
-        "created_at":  datetime.utcnow().isoformat(),
-        "ref":         "MANUAL-" + secrets.token_hex(4).upper(),
-        "active":      True,
+        "plan": plan,
+        "features": PLANS[plan]["features"],
+        "seats": PLANS[plan]["seats"],
+        "created_at": datetime.utcnow().isoformat(),
+        "ref": "MANUAL-" + secrets.token_hex(4).upper(),
+        "active": True,
         "activations": [],
     }
-
-    email_sent = send_license_email(email, name, plan, license_key)
-
+    # Send email asynchronously
+    thread = threading.Thread(target=send_license_email_async, args=(email, name, plan, license_key))
+    thread.start()
     return jsonify({
         "license_key": license_key,
-        "email_sent":  email_sent,
-        "plan":        plan,
+        "email_sent": "queued",
+        "plan": plan,
     }), 200
 
 @app.route("/admin/demo", methods=["POST"])
 @require_admin
 def admin_demo():
-    """Generate time-limited demo license for students"""
+    """Generate time-limited demo license for students (async email)"""
     try:
-        data         = request.get_json()
+        data = request.get_json()
         if not data:
             return jsonify({"error": "No JSON data received"}), 400
-
-        email        = data.get("email", "").strip()
-        name         = data.get("name", "Student").strip()
-        institution  = data.get("institution", "University of Ilorin").strip()
-        duration_days= int(data.get("duration_days", 30))
-
+        email = data.get("email", "").strip()
+        name = data.get("name", "Student").strip()
+        institution = data.get("institution", "University of Ilorin").strip()
+        duration_days = int(data.get("duration_days", 30))
         if not email:
             return jsonify({"error": "Email required"}), 400
-
         duration_days = min(max(duration_days, 1), 90)
-
         license_key = generate_license_key("student")
         while license_key in LICENSE_DB:
             license_key = generate_license_key("student")
-
         expires_at = (datetime.utcnow() + timedelta(days=duration_days)).isoformat()
-
         LICENSE_DB[license_key] = {
-            "key":          license_key,
-            "email":        email,
-            "name":         name,
-            "institution":  institution,
-            "plan":         "student_demo",
-            "features":     [
+            "key": license_key,
+            "email": email,
+            "name": name,
+            "institution": institution,
+            "plan": "student_demo",
+            "features": [
                 "mwm_full", "ymaze", "oft", "heatmap",
                 "png_export", "probe_trial", "learning_curve",
                 "trajectory", "csv_export",
             ],
-            "seats":        1,
-            "created_at":   datetime.utcnow().isoformat(),
-            "expires_at":   expires_at,
-            "duration_days":duration_days,
-            "ref":          "DEMO-" + secrets.token_hex(4).upper(),
-            "active":       True,
-            "activations":  [],
-            "is_demo":      True,
-        }
-
-        log.info(f"[Demo] Generated {license_key} for {email} — expires {expires_at}")
-
-        # Try email — don't crash if it fails
-        email_sent = False
-        try:
-            email_sent = send_demo_email(email, name, institution, license_key, duration_days, expires_at)
-        except Exception as e:
-            log.error(f"[Demo Email] Failed: {e}")
-
-        return jsonify({
-            "license_key":   license_key,
-            "email":         email,
-            "expires_at":    expires_at,
+            "seats": 1,
+            "created_at": datetime.utcnow().isoformat(),
+            "expires_at": expires_at,
             "duration_days": duration_days,
-            "plan":          "student_demo",
-            "email_sent":    email_sent,
+            "ref": "DEMO-" + secrets.token_hex(4).upper(),
+            "active": True,
+            "activations": [],
+            "is_demo": True,
+        }
+        log.info(f"[Demo] Generated {license_key} for {email} — expires {expires_at}")
+        # Send email asynchronously
+        thread = threading.Thread(
+            target=send_demo_email_async,
+            args=(email, name, institution, license_key, duration_days, expires_at)
+        )
+        thread.start()
+        return jsonify({
+            "license_key": license_key,
+            "email": email,
+            "expires_at": expires_at,
+            "duration_days": duration_days,
+            "plan": "student_demo",
+            "email_sent": "queued",
         }), 200
-
     except Exception as e:
         log.error(f"[Demo] Error: {e}")
         return jsonify({"error": str(e)}), 500
@@ -540,78 +510,68 @@ def admin_demo():
 @app.route("/admin/demo/bulk", methods=["POST"])
 @require_admin
 def admin_demo_bulk():
-    """Generate demo licenses for multiple students at once"""
+    """Generate demo licenses for multiple students at once (async email)"""
     try:
-        data         = request.get_json()
+        data = request.get_json()
         if not data:
             return jsonify({"error": "No JSON data received"}), 400
-
-        students     = data.get("students", [])
-        institution  = data.get("institution", "University of Ilorin")
-        duration_days= int(data.get("duration_days", 30))
-        duration_days= min(max(duration_days, 1), 90)
-
+        students = data.get("students", [])
+        institution = data.get("institution", "University of Ilorin")
+        duration_days = int(data.get("duration_days", 30))
+        duration_days = min(max(duration_days, 1), 90)
         if not students:
             return jsonify({"error": "No students provided"}), 400
-
         results = []
         for student in students:
             email = student.get("email", "").strip()
-            name  = student.get("name", "Student").strip()
+            name = student.get("name", "Student").strip()
             if not email:
                 continue
-
             try:
                 license_key = generate_license_key("student")
                 while license_key in LICENSE_DB:
                     license_key = generate_license_key("student")
-
                 expires_at = (datetime.utcnow() + timedelta(days=duration_days)).isoformat()
-
                 LICENSE_DB[license_key] = {
-                    "key":          license_key,
-                    "email":        email,
-                    "name":         name,
-                    "institution":  institution,
-                    "plan":         "student_demo",
-                    "features":     [
+                    "key": license_key,
+                    "email": email,
+                    "name": name,
+                    "institution": institution,
+                    "plan": "student_demo",
+                    "features": [
                         "mwm_full","ymaze","oft","heatmap",
                         "png_export","probe_trial","learning_curve",
                         "trajectory","csv_export",
                     ],
-                    "seats":        1,
-                    "created_at":   datetime.utcnow().isoformat(),
-                    "expires_at":   expires_at,
-                    "duration_days":duration_days,
-                    "ref":          "DEMO-" + secrets.token_hex(4).upper(),
-                    "active":       True,
-                    "activations":  [],
-                    "is_demo":      True,
+                    "seats": 1,
+                    "created_at": datetime.utcnow().isoformat(),
+                    "expires_at": expires_at,
+                    "duration_days": duration_days,
+                    "ref": "DEMO-" + secrets.token_hex(4).upper(),
+                    "active": True,
+                    "activations": [],
+                    "is_demo": True,
                 }
-
-                # Try email — don't crash if it fails
-                try:
-                    send_demo_email(email, name, institution, license_key, duration_days, expires_at)
-                except Exception as e:
-                    log.error(f"[Bulk Email] Failed for {email}: {e}")
-
+                # Send email asynchronously
+                thread = threading.Thread(
+                    target=send_demo_email_async,
+                    args=(email, name, institution, license_key, duration_days, expires_at)
+                )
+                thread.start()
                 results.append({
-                    "email":       email,
-                    "name":        name,
+                    "email": email,
+                    "name": name,
                     "license_key": license_key,
-                    "expires_at":  expires_at,
+                    "expires_at": expires_at,
                 })
                 log.info(f"[Demo Bulk] {license_key} → {email}")
-
             except Exception as e:
                 log.error(f"[Bulk] Failed for {email}: {e}")
                 continue
-
         return jsonify({
             "generated": len(results),
-            "licenses":  results,
+            "licenses": results,
         }), 200
-
     except Exception as e:
         log.error(f"[Bulk] Error: {e}")
         return jsonify({"error": str(e)}), 500
@@ -619,8 +579,7 @@ def admin_demo_bulk():
 @app.route("/admin/revoke", methods=["POST"])
 @require_admin
 def revoke_license():
-    """Revoke a license key"""
-    key     = request.get_json().get("key", "").upper()
+    key = request.get_json().get("key", "").upper()
     license = LICENSE_DB.get(key)
     if not license:
         return jsonify({"error": "License not found"}), 404
@@ -630,42 +589,20 @@ def revoke_license():
 @app.route("/admin/stats", methods=["GET"])
 @require_admin
 def stats():
-    """Dashboard stats"""
     plans_count = {}
     for lic in LICENSE_DB.values():
         p = lic["plan"]
         plans_count[p] = plans_count.get(p, 0) + 1
-
-    revenue_ngn = sum(
-        PLANS[lic["plan"]]["ngn"]
-        for lic in LICENSE_DB.values()
-        if lic.get("active") and lic["plan"] in PLANS
-    )
-
-    revenue_usd = sum(
-        PLANS[lic["plan"]]["usd"]
-        for lic in LICENSE_DB.values()
-        if lic.get("active") and lic["plan"] in PLANS
-    )
-
+    revenue_ngn = sum(PLANS[lic["plan"]]["ngn"] for lic in LICENSE_DB.values() if lic.get("active") and lic["plan"] in PLANS)
+    revenue_usd = sum(PLANS[lic["plan"]]["usd"] for lic in LICENSE_DB.values() if lic.get("active") and lic["plan"] in PLANS)
     return jsonify({
-        "total_licenses":    len(LICENSE_DB),
-        "active":            sum(1 for l in LICENSE_DB.values() if l.get("active")),
-        "by_plan":           plans_count,
+        "total_licenses": len(LICENSE_DB),
+        "active": sum(1 for l in LICENSE_DB.values() if l.get("active")),
+        "by_plan": plans_count,
         "total_revenue_ngn": revenue_ngn,
         "total_revenue_usd": revenue_usd,
     }), 200
 
-@app.route('/admin')
-def admin_panel():
-    """Serve the admin dashboard HTML"""
-    from flask import render_template
-    try:
-        return render_template('admin.html')
-    except Exception as e:
-        log.error(f"Failed to render admin.html: {e}")
-        return jsonify({"error": "Admin panel not found"}), 404
-      
 # ── Run ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
