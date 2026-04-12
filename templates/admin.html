@@ -412,22 +412,15 @@
 
   async function apiFetch(endpoint, options = {}) {
     const controller = new AbortController();
-    // 90 second timeout for Render free tier cold starts
     const timeoutId = setTimeout(() => controller.abort(), 90000);
-    
     try {
       const response = await fetch(`${API}${endpoint}`, {
-        headers: { 
-          'X-Admin-Secret': SECRET, 
-          'Content-Type': 'application/json'
-        },
+        headers: { 'X-Admin-Secret': SECRET, 'Content-Type': 'application/json' },
         mode: 'cors',
         signal: controller.signal,
         ...options
       });
-      
       clearTimeout(timeoutId);
-      
       if (!response.ok) {
         let errorMsg = `HTTP ${response.status}`;
         try {
@@ -436,12 +429,11 @@
         } catch(e) {}
         throw new Error(errorMsg);
       }
-      
       return response.json();
     } catch (error) {
       clearTimeout(timeoutId);
       if (error.name === 'AbortError') {
-        throw new Error('⏱️ Request timeout (90 seconds). The server might be waking up from sleep. Please wait a moment and try again.');
+        throw new Error('⏱️ Request timeout. The server may be waking up. Please wait and try again.');
       }
       throw error;
     }
@@ -454,23 +446,18 @@
     const btn = document.querySelector('.btn-login');
     errDiv.style.display = 'none';
     btn.disabled = true;
-    btn.textContent = 'Waking server (may take 30-60s)...';
-
+    btn.textContent = 'Connecting...';
     try {
-      const startTime = Date.now();
       const data = await apiFetch('/admin/stats');
-      const duration = ((Date.now() - startTime) / 1000).toFixed(1);
-      
       document.getElementById('loginScreen').style.display = 'none';
       document.getElementById('dashboard').style.display = 'block';
       updateTopStats(data);
       await loadLicenses();
-      btn.disabled = false;
-      btn.textContent = 'Access Dashboard →';
-      showNotification(`✅ Login successful! (Server responded in ${duration}s)`);
+      showNotification('✅ Login successful!');
     } catch (error) {
       errDiv.innerHTML = `❌ ${error.message}`;
       errDiv.style.display = 'block';
+    } finally {
       btn.disabled = false;
       btn.textContent = 'Access Dashboard →';
     }
@@ -500,11 +487,14 @@
     }
   }
 
+  // ✅ FIXED: generateDemo with proper variable declaration
   async function generateDemo() {
     const name = document.getElementById('demoName').value.trim();
     const email = document.getElementById('demoEmail').value.trim();
     const inst = document.getElementById('demoInstitution').value.trim();
-    const duration = document.getElementById('demoDuration').value;
+    const durationElem = document.getElementById('demoDuration');
+    const duration = parseInt(durationElem.value);
+    
     const btn = document.getElementById('btnGenDemo');
     const spin = document.getElementById('spinDemo');
     const result = document.getElementById('demoResult');
@@ -523,14 +513,14 @@
       const startTime = Date.now();
       const data = await apiFetch('/admin/demo', {
         method: 'POST',
-        body: JSON.stringify({ 
-          name: name, 
-          email: email, 
-          institution: inst, 
-          duration_days: parseInt(duration) 
+        body: JSON.stringify({
+          name: name,
+          email: email,
+          institution: inst,
+          duration_days: duration
         })
       });
-      const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
 
       document.getElementById('demoKeyDisplay').textContent = data.license_key;
       document.getElementById('demoDetails').innerHTML = `
@@ -538,8 +528,8 @@
         <strong>Email:</strong> ${escapeHtml(email)}<br/>
         <strong>Duration:</strong> ${duration} days<br/>
         <strong>Expires:</strong> ${new Date(data.expires_at).toLocaleDateString()}<br/>
-        <strong style="color:var(--green)">✅ License generated! (${duration}s)</strong><br/>
-        <small style="color:var(--muted)">Email may take an additional moment to arrive</small>
+        <strong style="color:var(--green)">✅ License generated! (${elapsed}s)</strong><br/>
+        <small>Email may take an additional moment to arrive</small>
       `;
       result.className = 'result-box success';
       result.style.display = 'block';
@@ -549,18 +539,14 @@
 
       await loadLicenses();
       await refreshTopStats();
-      
-      showNotification(`✅ Demo license generated for ${name}! (${duration}s)`);
+      showNotification(`✅ Demo license generated for ${name}! (${elapsed}s)`);
 
       setTimeout(() => {
         const licensesTab = document.querySelector('.tab[onclick*="licenses"]');
-        if (licensesTab) {
-          showTab('licenses', licensesTab);
-        }
+        if (licensesTab) showTab('licenses', licensesTab);
       }, 1500);
-
     } catch (error) {
-      console.error('Demo generation error:', error);
+      console.error(error);
       result.innerHTML = `❌ Error: ${escapeHtml(error.message)}<br/><small>If the server was sleeping, please wait 30 seconds and try again.</small>`;
       result.className = 'result-box error';
       result.style.display = 'block';
@@ -575,7 +561,8 @@
   async function generateBulk() {
     const raw = document.getElementById('bulkStudents').value.trim();
     const inst = document.getElementById('bulkInstitution').value.trim();
-    const dur = document.getElementById('bulkDuration').value;
+    const durElem = document.getElementById('bulkDuration');
+    const dur = parseInt(durElem.value);
     const btn = document.getElementById('btnBulk');
     const spin = document.getElementById('spinBulk');
     const result = document.getElementById('bulkResult');
@@ -598,7 +585,7 @@
       return;
     }
 
-    if (!confirm(`Generate ${students.length} demo licenses for ${dur} days? This may take up to 60 seconds.`)) return;
+    if (!confirm(`Generate ${students.length} demo licenses for ${dur} days?`)) return;
 
     btn.disabled = true;
     spin.style.display = 'inline-block';
@@ -608,7 +595,7 @@
     try {
       const data = await apiFetch('/admin/demo/bulk', {
         method: 'POST',
-        body: JSON.stringify({ students, institution: inst, duration_days: parseInt(dur) })
+        body: JSON.stringify({ students, institution: inst, duration_days: dur })
       });
 
       let html = `<div style="color:var(--green);margin-bottom:12px;">✅ Generated ${data.generated} licenses — emails sent!</div>`;
@@ -631,9 +618,7 @@
 
       await loadLicenses();
       await refreshTopStats();
-      
       showNotification(`✅ Generated ${data.generated} licenses!`);
-
     } catch (error) {
       result.innerHTML = `❌ Error: ${escapeHtml(error.message)}`;
       result.className = 'result-box error';
@@ -686,9 +671,7 @@
 
       await loadLicenses();
       await refreshTopStats();
-      
       showNotification(`✅ License generated for ${name}!`);
-
     } catch (error) {
       result.innerHTML = `❌ Error: ${escapeHtml(error.message)}`;
       result.className = 'result-box error';
@@ -727,12 +710,10 @@
       tbody.innerHTML = '<tr><td colspan="7" class="empty">No licenses found</td></tr>';
       return;
     }
-
     tbody.innerHTML = licenses.map(l => {
       const isDemo = l.is_demo || l.plan === 'student_demo';
       const isExpired = l.expires_at && new Date(l.expires_at) < new Date();
       const isActive = l.active && !isExpired;
-
       let expiryHtml = '<span style="color:var(--muted)">Lifetime</span>';
       if (l.expires_at) {
         const exp = new Date(l.expires_at);
@@ -741,24 +722,11 @@
         const left = Math.max(0, (exp - new Date()) / 86400000);
         const pct = total > 0 ? Math.min(100, Math.round((left / total) * 100)) : 0;
         const color = pct > 50 ? 'var(--green)' : pct > 20 ? 'var(--gold)' : 'var(--red)';
-        expiryHtml = `
-          <div class="days-bar">
-            <div class="days-track">
-              <div class="days-fill" style="width:${pct}%;background:${color}"></div>
-            </div>
-            <span style="color:${color};">${isExpired ? 'Expired' : Math.round(left) + 'd left'}</span>
-          </div>`;
+        expiryHtml = `<div class="days-bar"><div class="days-track"><div class="days-fill" style="width:${pct}%;background:${color}"></div></div><span style="color:${color};">${isExpired ? 'Expired' : Math.round(left) + 'd left'}</span></div>`;
       }
-
-      const statusBadge = !l.active ? '<span class="badge badge-expired">Revoked</span>' :
-                          isExpired ? '<span class="badge badge-expired">Expired</span>' :
-                          isDemo ? '<span class="badge badge-demo">Demo</span>' :
-                          '<span class="badge badge-paid">Active</span>';
-
+      const statusBadge = !l.active ? '<span class="badge badge-expired">Revoked</span>' : isExpired ? '<span class="badge badge-expired">Expired</span>' : isDemo ? '<span class="badge badge-demo">Demo</span>' : '<span class="badge badge-paid">Active</span>';
       return `<tr>
-        <td><span style="color:var(--gold);">${escapeHtml(l.key)}</span>
-          <button class="copy-btn" onclick="navigator.clipboard.writeText('${escapeHtml(l.key).replace(/'/g, "\\'")}')">Copy</button>
-        </td>
+        <td><span style="color:var(--gold);">${escapeHtml(l.key)}</span> <button class="copy-btn" onclick="navigator.clipboard.writeText('${escapeHtml(l.key).replace(/'/g, "\\'")}')">Copy</button></td>
         <td>${escapeHtml(l.name || '—')}</td>
         <td>${escapeHtml(l.email || '—')}</td>
         <td><span class="badge" style="background:var(--gold-d);color:var(--gold);">${escapeHtml(l.plan)}</span></td>
@@ -787,20 +755,14 @@
       document.getElementById('s-total').textContent = data.total_licenses || 0;
       document.getElementById('s-active').textContent = data.active || 0;
       document.getElementById('s-revenue').textContent = '$' + (data.total_revenue_usd || 0);
-      
-      const demo = Object.entries(data.by_plan || {})
-        .filter(([k]) => k.includes('demo'))
-        .reduce((a, [, v]) => a + v, 0);
+      const demo = Object.entries(data.by_plan || {}).filter(([k]) => k.includes('demo')).reduce((a, [, v]) => a + v, 0);
       document.getElementById('s-demo').textContent = demo;
-
       let breakdown = '';
       Object.entries(data.by_plan || {}).forEach(([plan, count]) => {
         const pct = data.total_licenses > 0 ? (count / data.total_licenses) * 100 : 0;
         breakdown += `<div style="display:flex;align-items:center;gap:12px;padding:6px 0;border-bottom:1px solid var(--dim);">
           <span style="width:140px;">${escapeHtml(plan)}</span>
-          <div style="flex:1;background:var(--dim);height:6px;">
-            <div style="width:${pct}%;background:var(--gold);height:100%;"></div>
-          </div>
+          <div style="flex:1;background:var(--dim);height:6px;"><div style="width:${pct}%;background:var(--gold);height:100%;"></div></div>
           <span style="color:var(--gold);">${count}</span>
         </div>`;
       });
